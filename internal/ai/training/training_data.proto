@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package gollemer.training;
+package dense.training;
 
-option go_package = "github.com/golangast/gollemer/internal/ai/training/proto;trainingpb";
+option go_package = "github.com/golangast/dense/internal/ai/training;trainingpb";
 
 // CommandExample represents a single multi-conversational training example.
 // This mirrors the richer format with system prompt, user prompt, assistant

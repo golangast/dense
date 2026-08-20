@@ -41,7 +41,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/golangast/gollemer/internal/ai/dense"
+	"github.com/golangast/dense/internal/ai/dense"
 )
 
 // ChatTurn is a single user/assistant exchange in the conversation history.

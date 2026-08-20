@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/golangast/gollemer/internal/ai/dense"
+	"github.com/golangast/dense/internal/ai/dense"
 )
 
 func main() {

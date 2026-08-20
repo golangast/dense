@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	trainingpb "github.com/golangast/gollemer/internal/ai/training/proto"
+	trainingpb "github.com/golangast/dense/internal/ai/training"
 )
 
 // LoadCommandExamplesFromCSV reads CommandExample records from a CSV file.
