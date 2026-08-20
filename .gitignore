@@ -1,0 +1,15 @@
+# Build artifacts
+bin/
+*.o
+*.a
+*.so
+
+# Go build artifacts
+*.exe
+*.out
+*.test
+
+# Editor files
+.vscode/
+.idea/
+*.swp
