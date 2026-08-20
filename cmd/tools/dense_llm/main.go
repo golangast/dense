@@ -341,7 +341,471 @@ func functionSnippetFromPrompt(prompt string) string {
 	return ""
 }
 
+// Intent represents a small structured intent extracted from the user's
+// prompt. The intent is intentionally minimal so the deterministic renderer
+// can generate syntactically-correct Go using go/ast.
+type Intent struct {
+	Action      string   // e.g. "ADD_FUNC", "ADD_ERROR_CHECK"
+	Name        string   // function or symbol name
+	Target      string   // variable to check, e.g. "err"
+	Ret         string   // return zero value (as source text) when needed
+	Params      []string // parameter strings like "name string", "n int"
+	Receiver    string   // receiver like "s *Service" or "*Service"
+	Returns     []string // return type strings like "bool", "error"
+	Description string   // description of the intent
+}
+
+// predictIntent extracts a structured intent from the prompt using simple
+// heuristics (and falling back to example matching). The model isn't asked
+// to produce raw code; instead it guides which action and parameters to take.
+func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, examples []dense.CommandExample) Intent {
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+	// Import intent
+	if strings.Contains(lower, "import ") || strings.Contains(lower, "add import") {
+		// try to extract a quoted import path
+		if i1 := strings.Index(prompt, "\""); i1 >= 0 {
+			if i2 := strings.Index(prompt[i1+1:], "\""); i2 >= 0 {
+				pkg := prompt[i1+1 : i1+1+i2]
+				if pkg != "" {
+					return Intent{Action: "ADD_IMPORT", Name: pkg}
+				}
+			}
+		}
+		// fallback: take last token
+		parts := strings.Fields(prompt)
+		if len(parts) > 0 {
+			last := strings.Trim(parts[len(parts)-1], " ,.")
+			return Intent{Action: "ADD_IMPORT", Name: last}
+		}
+	}
+	// Prefer explicit function creation patterns.
+	// Try to parse function or method name, params and returns from explicit
+	// signature patterns like: "create function Validate(name string) bool",
+	// or method forms like "create method DoThing on Service(a int) error".
+	if idx := strings.Index(lower, "function "); idx >= 0 {
+		after := prompt[idx+len("function "):]
+		// name up to '(' or end
+		name := strings.TrimSpace(after)
+		params := []string{}
+		rets := []string{}
+		receiver := ""
+		if i := strings.Index(after, "("); i >= 0 {
+			name = strings.TrimSpace(after[:i])
+			rest := after[i+1:]
+			if j := strings.Index(rest, ")"); j >= 0 {
+				paramsStr := rest[:j]
+				for _, p := range strings.Split(paramsStr, ",") {
+					if s := strings.TrimSpace(p); s != "" {
+						params = append(params, s)
+					}
+				}
+				// look after ')' for return type
+				post := strings.TrimSpace(rest[j+1:])
+				// examples: " bool", " returns bool", " -> (bool, error)"
+				if strings.HasPrefix(strings.ToLower(post), "returns ") {
+					rt := strings.TrimSpace(post[len("returns "):])
+					// split on ','
+					for _, r := range strings.Split(rt, ",") {
+						if s := strings.TrimSpace(strings.Trim(r, "()")); s != "" {
+							rets = append(rets, s)
+						}
+					}
+				} else if post != "" {
+					// if starts with '(' may contain multiple
+					if strings.HasPrefix(post, "(") {
+						p := strings.Trim(post, "() ")
+						for _, r := range strings.Split(p, ",") {
+							if s := strings.TrimSpace(r); s != "" {
+								rets = append(rets, s)
+							}
+						}
+					} else {
+						// single return type token
+						fields := strings.Fields(post)
+						if len(fields) > 0 {
+							rets = append(rets, strings.Trim(fields[0], ",."))
+						}
+					}
+				}
+			}
+		}
+		// Receiver heuristics: look for phrases like "method on Service" or "method of *Service"
+		recv := ""
+		if idx2 := strings.Index(strings.ToLower(prompt), "method on "); idx2 >= 0 {
+			after := strings.TrimSpace(prompt[idx2+len("method on "):])
+			recv = strings.Trim(strings.Fields(after)[0], " ,.")
+		} else if idx2 := strings.Index(strings.ToLower(prompt), "method of "); idx2 >= 0 {
+			after := strings.TrimSpace(prompt[idx2+len("method of "):])
+			recv = strings.Trim(strings.Fields(after)[0], " ,.")
+		} else if idx2 := strings.Index(strings.ToLower(prompt), "on type "); idx2 >= 0 {
+			after := strings.TrimSpace(prompt[idx2+len("on type "):])
+			recv = strings.Trim(strings.Fields(after)[0], " ,.")
+		}
+
+		// If we captured a name, return intent
+		if name != "" {
+			it := Intent{Action: "ADD_FUNC", Name: strings.Title(strings.TrimSpace(name)), Params: params, Receiver: receiver, Returns: rets}
+			if recv != "" && it.Receiver == "" {
+				it.Receiver = recv
+			}
+			return it
+		}
+	}
+
+	// Method form: "method NAME on RECEIVER(params) returns"
+	if idxm := strings.Index(lower, "method "); idxm >= 0 {
+		after := prompt[idxm+len("method "):]
+		name := strings.TrimSpace(after)
+		params := []string{}
+		rets := []string{}
+		receiver := ""
+		// check for ' on '
+		lowerAfter := strings.ToLower(after)
+		onIdx := strings.Index(lowerAfter, " on ")
+		var sigPart string
+		if onIdx >= 0 {
+			name = strings.TrimSpace(after[:onIdx])
+			afterOn := strings.TrimSpace(after[onIdx+len(" on "):])
+			// receiver may be followed immediately by '(' or a space. Extract
+			// receiver up to the first '(' if present, otherwise first token.
+			if i := strings.Index(afterOn, "("); i >= 0 {
+				receiver = strings.TrimSpace(afterOn[:i])
+				sigPart = afterOn[i:]
+			} else {
+				recFields := strings.Fields(afterOn)
+				if len(recFields) > 0 {
+					receiver = strings.Trim(recFields[0], " ,.")
+				}
+			}
+		} else {
+			sigPart = after
+		}
+		if sigPart != "" {
+			if i := strings.Index(sigPart, "("); i >= 0 {
+				name = strings.TrimSpace(name)
+				rest := sigPart[i+1:]
+				if j := strings.Index(rest, ")"); j >= 0 {
+					paramsStr := rest[:j]
+					for _, p := range strings.Split(paramsStr, ",") {
+						if s := strings.TrimSpace(p); s != "" {
+							params = append(params, s)
+						}
+					}
+					post := strings.TrimSpace(rest[j+1:])
+					if strings.HasPrefix(strings.ToLower(post), "returns ") {
+						rt := strings.TrimSpace(post[len("returns "):])
+						for _, r := range strings.Split(rt, ",") {
+							if s := strings.TrimSpace(strings.Trim(r, "()")); s != "" {
+								rets = append(rets, s)
+							}
+						}
+					} else if post != "" {
+						fields := strings.Fields(post)
+						if len(fields) > 0 {
+							rets = append(rets, strings.Trim(fields[0], ",."))
+						}
+					}
+				}
+			}
+		}
+		if name != "" {
+			return Intent{Action: "ADD_FUNC", Name: strings.Title(strings.TrimSpace(name)), Params: params, Receiver: receiver, Returns: rets}
+		}
+	}
+
+	// Error-check patterns.
+	if strings.Contains(lower, "err != nil") || strings.Contains(lower, "add error check") || strings.Contains(lower, "return on error") {
+		// choose default target var 'err'
+		ret := ""
+		if strings.Contains(lower, "return nil") || strings.Contains(lower, "return nil,") {
+			ret = "nil"
+		} else if strings.Contains(lower, "return \"\"") || strings.Contains(lower, "empty string") {
+			ret = `""`
+		} else if strings.Contains(lower, "return 0") {
+			ret = "0"
+		}
+		return Intent{Action: "ADD_ERROR_CHECK", Target: "err", Ret: ret}
+	}
+
+	// As a fallback consult the example matcher for known code_update snippets
+	// and try to extract a simple intent from the matched example.
+	m := dense.MatchCommandFromExamples(prompt, examples)
+	if m.Type == "code_update" && m.CodeAfter != "" {
+		// If the matched example contains a function declaration, prefer ADD_FUNC.
+		if strings.HasPrefix(strings.TrimSpace(m.CodeAfter), "func ") {
+			// crude parse: func Name
+			fields := strings.Fields(m.CodeAfter)
+			if len(fields) >= 2 {
+				name := fields[1]
+				if idx := strings.Index(name, "("); idx >= 0 {
+					name = name[:idx]
+				}
+				name = strings.TrimSpace(name)
+				if name != "" {
+					return Intent{Action: "ADD_FUNC", Name: name}
+				}
+			}
+		}
+	}
+	// Type/struct creation patterns
+	if strings.Contains(lower, "create struct") || strings.Contains(lower, "create type") || strings.Contains(lower, "add struct") {
+		// take the last field as the type name if present
+		parts := strings.Fields(prompt)
+		if len(parts) > 0 {
+			last := strings.Trim(parts[len(parts)-1], " ,.")
+			return Intent{Action: "ADD_TYPE", Name: last}
+		}
+	}
+
+	// Test creation patterns
+	if strings.Contains(lower, "unit test") || strings.Contains(lower, "add test") || strings.Contains(lower, "create test") {
+		// try to find the function name mentioned
+		parts := strings.Fields(prompt)
+		for i, p := range parts {
+			if strings.Contains(strings.ToLower(p), "for") && i+1 < len(parts) {
+				name := strings.Trim(parts[i+1], " ,.")
+				return Intent{Action: "ADD_TEST", Name: name}
+			}
+		}
+		return Intent{Action: "ADD_TEST", Name: "Example"}
+	}
+	return Intent{}
+}
+
+// renderIntentToCode deterministically converts an Intent to a Go code
+// snippet using go/ast and formatting, ensuring syntactic validity.
+func renderIntentToCode(intent Intent) (string, error) {
+	// No nested parseTypeExpr here; use package-level parseTypeExpr helper.
+	switch intent.Action {
+	case "ADD_FUNC":
+		if intent.Name == "" {
+			return "", nil
+		}
+		// Build: func Name(params) (returns) { // TODO }
+		fn := &ast.FuncDecl{
+			Name: ast.NewIdent(intent.Name),
+			Type: &ast.FuncType{Params: &ast.FieldList{}, Results: nil},
+			Body: &ast.BlockStmt{List: []ast.Stmt{}},
+		}
+		// Params
+		if len(intent.Params) > 0 {
+			var fields []*ast.Field
+			for _, p := range intent.Params {
+				// p like "name string" or "int"
+				parts := strings.Fields(p)
+				var name string
+				var typ string
+				if len(parts) == 1 {
+					typ = parts[0]
+				} else if len(parts) >= 2 {
+					name = parts[0]
+					typ = strings.Join(parts[1:], " ")
+				}
+				var field *ast.Field
+				if name != "" {
+					field = &ast.Field{Names: []*ast.Ident{ast.NewIdent(name)}, Type: parseTypeExpr(typ)}
+				} else {
+					field = &ast.Field{Type: parseTypeExpr(typ)}
+				}
+				fields = append(fields, field)
+			}
+			fn.Type.Params = &ast.FieldList{List: fields}
+		}
+		// Returns
+		if len(intent.Returns) > 0 {
+			var rfields []*ast.Field
+			for _, r := range intent.Returns {
+				rfields = append(rfields, &ast.Field{Type: parseTypeExpr(r)})
+			}
+			fn.Type.Results = &ast.FieldList{List: rfields}
+		}
+		// Body: add TODO return if we have returns
+		if len(intent.Returns) > 0 {
+			// create a return of zero values based on simple types
+			var exprs []ast.Expr
+			for _, r := range intent.Returns {
+				switch r {
+				case "int", "int64", "int32":
+					exprs = append(exprs, &ast.BasicLit{Kind: token.INT, Value: "0"})
+				case "string":
+					exprs = append(exprs, &ast.BasicLit{Kind: token.STRING, Value: `""`})
+				case "bool":
+					exprs = append(exprs, ast.NewIdent("false"))
+				default:
+					// assume nilable
+					exprs = append(exprs, ast.NewIdent("nil"))
+				}
+			}
+			ret := &ast.ReturnStmt{Results: exprs}
+			fn.Body.List = append(fn.Body.List, ret)
+		} else {
+			// default TODO comment
+			fn.Body.List = append(fn.Body.List, &ast.ExprStmt{X: &ast.BasicLit{Kind: token.STRING, Value: `"TODO: implement"`}})
+		}
+		// Receiver
+		if strings.TrimSpace(intent.Receiver) != "" {
+			r := strings.TrimSpace(intent.Receiver)
+			parts := strings.Fields(r)
+			var rname string
+			var rtype string
+			if len(parts) >= 2 {
+				rname = parts[0]
+				rtype = strings.Join(parts[1:], " ")
+			} else {
+				rtype = parts[0]
+				// derive receiver name from type (first letter lowercased)
+				tn := strings.TrimPrefix(rtype, "*")
+				if tn == "" {
+					rname = "r"
+				} else {
+					rname = strings.ToLower(tn[:1])
+				}
+			}
+			fn.Recv = &ast.FieldList{List: []*ast.Field{{Names: []*ast.Ident{ast.NewIdent(rname)}, Type: parseTypeExpr(rtype)}}}
+		}
+
+		// Render the node to source.
+		var sb strings.Builder
+		if err := format.Node(&sb, token.NewFileSet(), fn); err != nil {
+			return "", err
+		}
+		// Ensure trailing newline
+		out := sb.String()
+		if !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out, nil
+	case "ADD_IMPORT":
+		if intent.Name == "" {
+			return "", nil
+		}
+		// return a single import spec
+		out := fmt.Sprintf("import %q\n", intent.Name)
+		return out, nil
+	case "ADD_TYPE":
+		if intent.Name == "" {
+			return "", nil
+		}
+		// type Name struct {}
+		ts := &ast.GenDecl{
+			Tok: token.TYPE,
+			Specs: []ast.Spec{
+				&ast.TypeSpec{
+					Name: ast.NewIdent(intent.Name),
+					Type: &ast.StructType{Fields: &ast.FieldList{}},
+				},
+			},
+		}
+		var sb strings.Builder
+		if err := format.Node(&sb, token.NewFileSet(), ts); err != nil {
+			return "", err
+		}
+		out := sb.String()
+		if !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out, nil
+	case "ADD_TEST":
+		name := intent.Name
+		if name == "" {
+			name = "Example"
+		}
+		// Ensure test function name starts with Test
+		if !strings.HasPrefix(name, "Test") {
+			name = "Test" + strings.Title(name)
+		}
+		fn := &ast.FuncDecl{
+			Name: ast.NewIdent(name),
+			Type: &ast.FuncType{
+				Params: &ast.FieldList{List: []*ast.Field{{Type: ast.NewIdent("*testing.T")}}},
+			},
+			Body: &ast.BlockStmt{List: []ast.Stmt{
+				&ast.ExprStmt{X: &ast.CallExpr{Fun: ast.NewIdent("t.Skip"), Args: []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: `"TODO: implement"`}}}},
+			}},
+		}
+		var sb2 strings.Builder
+		if err := format.Node(&sb2, token.NewFileSet(), fn); err != nil {
+			return "", err
+		}
+		out := sb2.String()
+		if !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out, nil
+	case "ADD_ERROR_CHECK":
+		// Build: if err != nil { return <Ret> }
+		cond := &ast.BinaryExpr{
+			X:  ast.NewIdent(intent.Target),
+			Op: token.NEQ,
+			Y:  ast.NewIdent("nil"),
+		}
+		var retStmt ast.Stmt
+		if intent.Ret != "" {
+			// return <Ret>
+			retStmt = &ast.ReturnStmt{Results: []ast.Expr{&ast.Ident{Name: intent.Ret}}}
+		} else {
+			// generic: return
+			retStmt = &ast.ReturnStmt{}
+		}
+		blk := &ast.BlockStmt{List: []ast.Stmt{retStmt}}
+		ifStmt := &ast.IfStmt{Cond: cond, Body: blk}
+		var sb strings.Builder
+		if err := format.Node(&sb, token.NewFileSet(), ifStmt); err != nil {
+			return "", err
+		}
+		out := sb.String()
+		if !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out, nil
+	default:
+		return "", nil
+	}
+}
+
 func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.DenseModel, examples []dense.CommandExample) string {
+	// Inspect the target Go file (if any) to gather structural context that
+	// can influence classification and response construction. This allows the
+	// assistant to prefer edits over creates when the target already contains
+	// matching symbols, or to prefer code_update when a function exists.
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+	target := ""
+	if conv != nil {
+		target = conv.TargetGoFile()
+	}
+	var hasFunc = map[string]bool{}
+	var hasType = map[string]bool{}
+	var hasImport = map[string]bool{}
+	if target != "" {
+		if fi, err := os.Stat(target); err == nil && !fi.IsDir() && strings.HasSuffix(target, ".go") {
+			fset := token.NewFileSet()
+			if node, err := parser.ParseFile(fset, target, nil, parser.ParseComments); err == nil {
+				// collect functions, types and imports
+				for _, decl := range node.Decls {
+					if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name != nil {
+						hasFunc[strings.ToLower(fn.Name.Name)] = true
+					}
+					if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
+						for _, spec := range gd.Specs {
+							if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name != nil {
+								hasType[strings.ToLower(ts.Name.Name)] = true
+							}
+						}
+					}
+				}
+				for _, imp := range node.Imports {
+					if imp.Path != nil {
+						p := strings.Trim(imp.Path.Value, `"`)
+						hasImport[strings.ToLower(p)] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Base classification using heuristics + model fallback. We'll allow the
+	// observed target file structure to nudge the decision when the prompt
+	// mentions symbols that already exist.
 	cmdType := dense.ClassifyCommandType(prompt)
 	if cmdType == "social" {
 		input := dense.BagOfWords(prompt, dense.CommandVocab)
@@ -357,9 +821,43 @@ func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.D
 		}
 	}
 
+	// If the user asked to create a file but a target .go file is already set
+	// and exists, prefer an edit instead of a create.
+	if target != "" && strings.Contains(lower, "create file") && strings.HasSuffix(target, ".go") {
+		if _, err := os.Stat(target); err == nil {
+			cmdType = "file_edit"
+		}
+	}
+
+	// If the prompt appears to request creating a function but the target file
+	// already contains that function name, prefer `code_update` to indicate an
+	// in-file edit instead of inserting duplicate definitions.
+	if snippet := functionSnippetFromPrompt(prompt); snippet != "" {
+		// extract the function name from the snippet: "func Name(" -> Name
+		parts := strings.Fields(snippet)
+		if len(parts) >= 2 {
+			name := parts[1]
+			if idx := strings.Index(name, "("); idx >= 0 {
+				name = name[:idx]
+			}
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name != "" && hasFunc[name] {
+				cmdType = "code_update"
+			}
+		}
+	}
+
 	if cmdType == "code_update" {
 		if snippet := functionSnippetFromPrompt(prompt); snippet != "" {
 			return "🔧 " + snippet
+		}
+	}
+
+	// Use the lightweight intent predictor + AST renderer to produce
+	// deterministic, syntax-correct code for well-understood intents.
+	if intent := predictIntent(prompt, conv, model, examples); intent.Action != "" {
+		if code, err := renderIntentToCode(intent); err == nil && code != "" {
+			return "🔧 " + code
 		}
 	}
 
@@ -800,6 +1298,132 @@ func applyCodeViaAST(filePath, content, code string) (bool, string, error) {
 	return false, "", nil
 }
 
+// recommendAfterAction inspects the file and the recent action message and
+// generates short, pragmatic recommendations (tests, formatting, vet runs,
+// imports) as a follow-up suggestion to present to the user.
+func recommendAfterAction(filePath, actionMsg, codeSnippet string) string {
+	if filePath == "" {
+		return ""
+	}
+	fset := token.NewFileSet()
+	if _, err := parser.ParseFile(fset, filePath, nil, parser.ParseComments); err != nil {
+		return ""
+	}
+
+	var suggestions []string
+	// Suggest adding a unit test when we've inserted/updated a function.
+	if strings.Contains(strings.ToLower(actionMsg), "function") || strings.Contains(strings.ToLower(actionMsg), "inserted") || strings.Contains(strings.ToLower(actionMsg), "updated") {
+		suggestions = append(suggestions, "Add a unit test for the new/updated function.")
+		suggestions = append(suggestions, fmt.Sprintf("Run `gofmt -w %s` and `go vet %s`.", filepath.Base(filePath), filepath.Dir(filePath)))
+	}
+	// If an import was added, suggest checking for unused imports.
+	if strings.Contains(strings.ToLower(actionMsg), "import") {
+		suggestions = append(suggestions, "Ensure the imported package is used; remove unused imports.")
+	}
+	// Generic Go-file suggestions.
+	if strings.HasSuffix(filePath, ".go") {
+		suggestions = append(suggestions, "Consider running `go test ./...` if this change affects behavior.")
+	}
+
+	if len(suggestions) == 0 {
+		return ""
+	}
+	return "\n💡 Recommendations:\n- " + strings.Join(suggestions, "\n- ")
+}
+
+// parseTypeExpr parses a simple type description into an AST expression.
+// Supports maps, slices, pointers, selector expressions, channels, func types,
+// and index/generic-like expressions.
+func parseTypeExpr(typ string) ast.Expr {
+	typ = strings.TrimSpace(typ)
+	if typ == "" {
+		return ast.NewIdent("interface{}")
+	}
+	// function type
+	if strings.HasPrefix(typ, "func(") {
+		end := strings.Index(typ, ")")
+		if end >= 0 {
+			paramsStr := typ[len("func("):end]
+			var params []*ast.Field
+			for _, p := range strings.Split(paramsStr, ",") {
+				p = strings.TrimSpace(p)
+				if p == "" {
+					continue
+				}
+				parts := strings.Fields(p)
+				if len(parts) == 1 {
+					params = append(params, &ast.Field{Type: parseTypeExpr(parts[0])})
+				} else {
+					name := parts[0]
+					t := strings.Join(parts[1:], " ")
+					params = append(params, &ast.Field{Names: []*ast.Ident{ast.NewIdent(name)}, Type: parseTypeExpr(t)})
+				}
+			}
+			rest := strings.TrimSpace(typ[end+1:])
+			var results *ast.FieldList
+			if rest != "" {
+				rest = strings.TrimSpace(rest)
+				if strings.HasPrefix(rest, "(") && strings.HasSuffix(rest, ")") {
+					rest = strings.Trim(rest, "() ")
+				}
+				if rest != "" {
+					var rfields []*ast.Field
+					for _, r := range strings.Split(rest, ",") {
+						r = strings.TrimSpace(r)
+						if r == "" {
+							continue
+						}
+						parts := strings.Fields(r)
+						if len(parts) == 1 {
+							rfields = append(rfields, &ast.Field{Type: parseTypeExpr(parts[0])})
+						} else {
+							rfields = append(rfields, &ast.Field{Names: []*ast.Ident{ast.NewIdent(parts[0])}, Type: parseTypeExpr(strings.Join(parts[1:], " "))})
+						}
+					}
+					results = &ast.FieldList{List: rfields}
+				}
+			}
+			return &ast.FuncType{Params: &ast.FieldList{List: params}, Results: results}
+		}
+	}
+	// map[K]V
+	if strings.HasPrefix(typ, "map[") {
+		if idx := strings.Index(typ, "]"); idx > 4 {
+			key := strings.TrimSpace(typ[len("map["):idx])
+			val := strings.TrimSpace(typ[idx+1:])
+			return &ast.MapType{Key: parseTypeExpr(key), Value: parseTypeExpr(val)}
+		}
+	}
+	// channel
+	if strings.HasPrefix(typ, "chan ") {
+		return &ast.ChanType{Value: parseTypeExpr(strings.TrimSpace(strings.TrimPrefix(typ, "chan ")))}
+	}
+	// slice
+	if strings.HasPrefix(typ, "[]") {
+		return &ast.ArrayType{Elt: parseTypeExpr(strings.TrimPrefix(typ, "[]"))}
+	}
+	// pointer
+	if strings.HasPrefix(typ, "*") {
+		return &ast.StarExpr{X: parseTypeExpr(strings.TrimPrefix(typ, "*"))}
+	}
+	// generic/index expression like MyType[T]
+	if i := strings.Index(typ, "["); i > 0 && strings.HasSuffix(typ, "]") {
+		x := strings.TrimSpace(typ[:i])
+		inside := strings.TrimSpace(typ[i+1 : len(typ)-1])
+		return &ast.IndexExpr{X: ast.NewIdent(x), Index: parseTypeExpr(inside)}
+	}
+	// selector expressions a.b.c -> nested SelectorExprs
+	if strings.Contains(typ, ".") {
+		parts := strings.Split(typ, ".")
+		var expr ast.Expr = ast.NewIdent(parts[0])
+		for _, p := range parts[1:] {
+			expr = &ast.SelectorExpr{X: expr, Sel: ast.NewIdent(p)}
+		}
+		return expr
+	}
+	return ast.NewIdent(typ)
+}
+
 // addImportToNode adds an import path to the file's import declarations,
 // creating the import block if needed.
 func addImportToNode(node *ast.File, path string) {
@@ -1032,6 +1656,9 @@ func main() {
 				response += fmt.Sprintf("\n⚠️  Could not apply to %s: %v", target, err)
 			} else {
 				response += fmt.Sprintf("\n✅ Applied to %s: %s", target, msg)
+				if recs := recommendAfterAction(target, msg, code); recs != "" {
+					response += recs
+				}
 			}
 			return response
 		}
@@ -1072,6 +1699,9 @@ func main() {
 				response += fmt.Sprintf("\n⚠️  Could not apply to %s: %v", target, err)
 			} else {
 				response += fmt.Sprintf("\n✅ %s", msg)
+				if recs := recommendAfterAction(target, msg, content); recs != "" {
+					response += recs
+				}
 			}
 			return response
 		}
