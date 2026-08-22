@@ -15,6 +15,8 @@ help:
 	@echo "  make fmt                 Format Go sources"
 	@echo "  make tidy                Run go mod tidy"
 	@echo "  make clean               Remove build artifacts"
+	@echo "  run-dense_llm            Run the dense_llm binary"
+	@echo "  run-dense_train          Run the dense_train binary"
 
 build: $(DENSE_LLM) $(DENSE_TRAIN)
 
@@ -45,8 +47,9 @@ clean:
 install:
 	go install ./cmd/tools/...
 
-run-dense_llm: build-dense_llm
+llm: build-dense_llm
 	./$(DENSE_LLM)
 
-run-dense_train: build-dense_train
+train: build-dense_train
 	./$(DENSE_TRAIN)
+

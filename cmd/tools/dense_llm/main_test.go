@@ -57,6 +57,21 @@ func TestFunctionSnippetFromPrompt_ReplaceWithNewFunctionNameSignature(t *testin
 	}
 }
 
+func TestFunctionSnippetFromPrompt_ReplaceWithSignatureDoesNotRepeatOldName(t *testing.T) {
+	prompt := `please swap function oldHandler for newHandler() error { return nil }`
+	got := functionSnippetFromPrompt(prompt)
+	if got == "" {
+		t.Fatal("functionSnippetFromPrompt returned empty for signature replacement")
+	}
+	want := "func newHandler() error { return nil }\n"
+	if got != want {
+		t.Fatalf("functionSnippetFromPrompt(%q) = %q, want %q", prompt, got, want)
+	}
+	if strings.Contains(got, "func oldHandler") {
+		t.Fatalf("functionSnippetFromPrompt(%q) = %q, should not repeat the old function name", prompt, got)
+	}
+}
+
 func TestResolvePromptTarget_PrefersExplicitPromptPathOverStaleConversationTarget(t *testing.T) {
 	prompt := `in the file jim/jim.go replace jim with sally() int {return 3}`
 	if got := resolvePromptTarget(prompt, "/tmp/stale.go"); got != "jim/jim.go" {
@@ -214,6 +229,30 @@ func TestApplyFunctionReplacement_RepairsCorruptedFunction(t *testing.T) {
 	}
 	if !strings.Contains(string(contents), `return "jim"`) {
 		t.Fatalf("repaired file should contain corrected body, got: %s", contents)
+	}
+}
+
+func TestApplyCodeViaAST_ReplacesExistingFunction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dense_generated.go")
+	original := "package main\n\ntype GeneratedModel struct {\n\tFirstName string\n\tLastName string\n}\n\nfunc newHandler() error {\n\treturn nil\n}\n"
+	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+		t.Fatalf("write original file: %v", err)
+	}
+
+	applied, _, err := applyCodeViaAST(path, original, "func newHandler() error { return nil }")
+	if err != nil {
+		t.Fatalf("applyCodeViaAST should succeed for an existing function name: %v", err)
+	}
+	if !applied {
+		t.Fatal("applyCodeViaAST should report success when replacing an existing function")
+	}
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read updated file: %v", err)
+	}
+	if !strings.Contains(string(contents), "func newHandler() error") {
+		t.Fatalf("updated file should still contain newHandler, got: %s", contents)
 	}
 }
 

@@ -608,6 +608,28 @@ func splitFileCommand(raw string) (string, string) {
 	return strings.TrimSpace(trimmed), ""
 }
 
+func normalizeReplacementFunction(name, replacement string) string {
+	replacement = strings.TrimSpace(replacement)
+	replacement = strings.TrimSpace(strings.TrimSuffix(replacement, "."))
+	if replacement == "" {
+		return ""
+	}
+	lower := strings.ToLower(replacement)
+	if strings.HasPrefix(lower, "func ") {
+		return replacement
+	}
+	if idx := strings.Index(replacement, "("); idx > 0 && idx < len(replacement) {
+		prefix := strings.TrimSpace(replacement[:idx])
+		if prefix != "" && regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(prefix) {
+			return "func " + replacement
+		}
+	}
+	if name == "" {
+		return "func " + replacement
+	}
+	return "func " + name + " " + replacement
+}
+
 func functionSnippetFromPrompt(prompt string) string {
 	parsed := dense.ParseHybridPrompt(prompt)
 	if parsed.Action == "replace" {
@@ -615,14 +637,11 @@ func functionSnippetFromPrompt(prompt string) string {
 		replacement = strings.TrimSpace(strings.TrimSuffix(replacement, "."))
 		replacement = regexp.MustCompile("(?i)\\s+(?:in\\s+)?(?:file\\s+)?[A-Za-z0-9_./\\\\-]+\\.go\\s*$").ReplaceAllString(replacement, "")
 		replacement = strings.TrimSpace(replacement)
-		if strings.HasPrefix(strings.ToLower(replacement), "func ") {
-			return replacement + "\n"
-		}
-		if strings.Contains(strings.ToLower(replacement), "func ") {
-			return replacement + "\n"
-		}
 		if len(parsed.Identifiers) > 0 {
-			return "func " + parsed.Identifiers[0] + " " + replacement + "\n"
+			return normalizeReplacementFunction(parsed.Identifiers[0], replacement) + "\n"
+		}
+		if replacement != "" {
+			return normalizeReplacementFunction("", replacement) + "\n"
 		}
 	}
 	lower := strings.ToLower(strings.TrimSpace(prompt))
@@ -876,9 +895,9 @@ func applyFunctionReplacement(filePath, name, replacement string) (string, error
 		return "", err
 	}
 	text := string(content)
-	trimmedReplacement := strings.TrimSpace(replacement)
-	if !strings.HasPrefix(strings.ToLower(trimmedReplacement), "func ") {
-		trimmedReplacement = "func " + name + " " + trimmedReplacement
+	trimmedReplacement := normalizeReplacementFunction(name, replacement)
+	if trimmedReplacement == "" {
+		return "", fmt.Errorf("empty replacement")
 	}
 
 	fileSet := token.NewFileSet()
@@ -2285,9 +2304,7 @@ func tryApplyExactFunctionReplacement(prompt, target string) (bool, string) {
 			if name == "" || replacement == "" {
 				return false, ""
 			}
-			if !strings.HasPrefix(strings.ToLower(replacement), "func ") && !strings.Contains(strings.ToLower(replacement), "func ") {
-				replacement = "func " + replacement
-			}
+			replacement = normalizeReplacementFunction(name, replacement)
 			if _, err := applyFunctionReplacement(target, name, replacement); err == nil {
 				return true, fmt.Sprintf("✅ Applied exact replacement to %s", target)
 			}
@@ -2313,9 +2330,7 @@ func tryApplyExactFunctionReplacement(prompt, target string) (bool, string) {
 	if name == "" || replacement == "" {
 		return false, ""
 	}
-	if !strings.HasPrefix(strings.ToLower(replacement), "func ") && !strings.Contains(strings.ToLower(replacement), "func ") {
-		replacement = "func " + replacement
-	}
+	replacement = normalizeReplacementFunction(name, replacement)
 	if _, err := applyFunctionReplacement(target, name, replacement); err == nil {
 		return true, fmt.Sprintf("✅ Applied exact replacement to %s", target)
 	}
@@ -3057,6 +3072,7 @@ func applyCodeViaAST(filePath, content, code string) (bool, string, error) {
 				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == newFunc.Name.Name {
 					node.Decls[i] = newFunc
 					replaced = true
+					added = true
 					break
 				}
 			}
