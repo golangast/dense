@@ -72,6 +72,24 @@ func TestFunctionSnippetFromPrompt_ReplaceWithSignatureDoesNotRepeatOldName(t *t
 	}
 }
 
+func TestFunctionSnippetFromPrompt_StripsStaleTargetPrefixBeforeReplacementSignature(t *testing.T) {
+	prompt := `please substitute function ProcesOrdr for ProcessOrderV2() error { return nil }`
+	got := functionSnippetFromPrompt(prompt)
+	if got == "" {
+		t.Fatal("functionSnippetFromPrompt returned empty for typoed replacement prompt")
+	}
+	want := "func ProcessOrderV2() error { return nil }\n"
+	if got != want {
+		t.Fatalf("functionSnippetFromPrompt(%q) = %q, want %q", prompt, got, want)
+	}
+	if strings.Contains(got, "func ProcesOrdr") {
+		t.Fatalf("functionSnippetFromPrompt(%q) = %q, should not keep the stale target name", prompt, got)
+	}
+	if strings.Contains(got, "For ProcessOrderV2") {
+		t.Fatalf("functionSnippetFromPrompt(%q) = %q, should not keep the leading 'for' marker", prompt, got)
+	}
+}
+
 func TestResolvePromptTarget_PrefersExplicitPromptPathOverStaleConversationTarget(t *testing.T) {
 	prompt := `in the file jim/jim.go replace jim with sally() int {return 3}`
 	if got := resolvePromptTarget(prompt, "/tmp/stale.go"); got != "jim/jim.go" {

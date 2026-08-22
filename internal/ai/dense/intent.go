@@ -1,7 +1,6 @@
 package dense
 
 import (
-	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/scanner"
@@ -45,13 +44,19 @@ func ParseHybridPrompt(prompt string) ParsedPrompt {
 
 	for i, t := range tokens {
 		lower := strings.ToLower(t)
-		if lower == "replace" || lower == "swap" || lower == "change" {
+		if lower == "replace" || lower == "swap" || lower == "change" || lower == "substitute" || lower == "update" {
 			res.Action = "replace"
 		}
 
 		if (lower == "with" || lower == "for") && i+1 < len(positions) {
 			codeStart := positions[i+1] - 1
 			res.RawCode = strings.TrimSpace(prompt[codeStart:])
+			for _, prefix := range []string{"for ", "with ", "to "} {
+				if strings.HasPrefix(strings.ToLower(res.RawCode), prefix) {
+					res.RawCode = strings.TrimSpace(res.RawCode[len(prefix):])
+					break
+				}
+			}
 			break
 		}
 
@@ -72,9 +77,20 @@ func ParseHybridPrompt(prompt string) ParsedPrompt {
 }
 
 func ReplaceFunctionDecl(file *ast.File, targetName string, newFuncSource string) bool {
-	src := fmt.Sprintf("package dummy\n%s", newFuncSource)
+	if file == nil || targetName == "" {
+		return false
+	}
+
+	snippet := strings.TrimSpace(newFuncSource)
+	if snippet == "" {
+		return false
+	}
+	if !strings.HasPrefix(snippet, "func ") {
+		snippet = "func " + snippet
+	}
+
 	fset := token.NewFileSet()
-	parsed, err := parser.ParseFile(fset, "", src, 0)
+	parsed, err := parser.ParseFile(fset, "", "package dummy\n"+snippet, 0)
 	if err != nil || len(parsed.Decls) == 0 {
 		return false
 	}
@@ -121,22 +137,24 @@ func RouteAndExecute(file *ast.File, prompt string) bool {
 }
 
 func RouteAndExecuteWorkspace(graph *WorkspaceGraph, targetFile string, prompt string) (string, bool) {
+	slot := ParsePromptWithSlots(prompt, graph)
+	return RouteAndExecuteWorkspaceWithSlot(graph, targetFile, slot)
+}
+
+func RouteAndExecuteWorkspaceWithSlot(graph *WorkspaceGraph, targetFile string, slot ParsedSlot) (string, bool) {
 	if graph == nil {
 		return "", false
 	}
-
-	parsed := ParseHybridPrompt(prompt)
-	actualFile := targetFile
-
-	if actualFile == "" && len(parsed.Identifiers) > 0 {
-		for _, ident := range parsed.Identifiers {
-			if sym, found := graph.FindSymbol(ident); found {
-				actualFile = sym.FilePath
-				break
-			}
-		}
+	if slot.TargetSymbol == "" {
+		return "", false
 	}
 
+	actualFile := targetFile
+	if actualFile == "" {
+		if sym, found := graph.Symbols[slot.TargetSymbol]; found {
+			actualFile = sym.FilePath
+		}
+	}
 	if actualFile == "" {
 		return "", false
 	}
@@ -146,8 +164,16 @@ func RouteAndExecuteWorkspace(graph *WorkspaceGraph, targetFile string, prompt s
 		return actualFile, false
 	}
 
-	success := RouteAndExecute(fileAST, prompt)
-	return actualFile, success
+	switch slot.Action {
+	case "REPLACE":
+		if slot.PayloadCode != "" {
+			return actualFile, ReplaceFunctionDecl(fileAST, slot.TargetSymbol, slot.PayloadCode)
+		}
+	case "INJECT_TAGS":
+		return actualFile, AutoInjectJSONTags(fileAST, slot.TargetSymbol)
+	}
+
+	return actualFile, false
 }
 
 func RouteAndExecuteNLP(graph *WorkspaceGraph, targetFile string, prompt string) (string, bool) {

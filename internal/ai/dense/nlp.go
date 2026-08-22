@@ -9,6 +9,31 @@ import (
 
 var nonAlphaRegex = regexp.MustCompile(`[^a-zA-Z0-9\s]`)
 
+var VerbSynsets = map[string]string{
+	"swap":       "REPLACE",
+	"replace":    "REPLACE",
+	"substitute": "REPLACE",
+	"change":     "REPLACE",
+	"update":     "REPLACE",
+	"inject":     "ADD_TAGS",
+	"annotate":   "ADD_TAGS",
+	"tag":        "ADD_TAGS",
+	"label":      "ADD_TAGS",
+	"attach":     "ADD_TAGS",
+	"add":        "ADD_TAGS",
+	"wrap":       "WRAP",
+	"decorate":   "WRAP",
+}
+
+// PromptSlots holds a lightweight, semantic breakdown of a natural-language prompt.
+type PromptSlots struct {
+	Action  string
+	Target  string
+	Type    string
+	Payload string
+	Tokens  []string
+}
+
 // IntentClass is kept as an alias to the project’s existing intent enum so the
 // NLP pipeline remains compatible with the rest of the AST mutation engine.
 type IntentClass = IntentType
@@ -50,6 +75,175 @@ func TokenizePrompt(prompt string) []string {
 	}
 
 	return append(tokens, biGrams...)
+}
+
+func normalizeSymbolCandidate(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(strings.TrimSuffix(s, "."), " ")
+	s = regexp.MustCompile(`[^A-Za-z0-9]+`).ReplaceAllString(s, "")
+	return strings.ToLower(s)
+}
+
+func levenshteinDistance(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+
+	prev := make([]int, len(b)+1)
+	curr := make([]int, len(b)+1)
+	for j := 0; j <= len(b); j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		curr[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+			if del < ins {
+				ins = del
+			}
+			if sub < ins {
+				ins = sub
+			}
+			curr[j] = ins
+		}
+		copy(prev, curr)
+	}
+	return prev[len(b)]
+}
+
+func ParsePromptSlots(prompt string) PromptSlots {
+	out := PromptSlots{Action: "UNKNOWN"}
+	trimmed := strings.TrimSpace(prompt)
+	if trimmed == "" {
+		return out
+	}
+
+	lower := strings.ToLower(trimmed)
+	for word, action := range VerbSynsets {
+		if strings.Contains(lower, word) {
+			out.Action = action
+			break
+		}
+	}
+
+	var targetPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(?:swap|replace|change|update|substitute)\s+(?:function|fn|method|func|type|struct)?\s*([A-Za-z_][A-Za-z0-9_]*)\s+(?:for|with|to)\s+(.+)$`),
+		regexp.MustCompile(`(?i)(?:add|inject|annotate|tag|label|attach)\s+(?:json\s+)?(?:tags?|labels?)\s+(?:to|into|in)\s+([A-Za-z_][A-Za-z0-9_]*)`),
+		regexp.MustCompile(`(?i)(?:add|inject|annotate|tag|label|attach)\s+(?:json\s+)?(?:tags?|labels?)\s+(?:to|into|in)\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)`),
+		regexp.MustCompile(`(?i)(?:for|with|to)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|\()`),
+	}
+	for _, re := range targetPatterns {
+		if m := re.FindStringSubmatch(trimmed); len(m) > 1 {
+			if out.Action == "REPLACE" || out.Action == "ADD_TAGS" {
+				out.Target = m[1]
+				if len(m) > 2 && strings.TrimSpace(m[2]) != "" {
+					out.Payload = strings.TrimSpace(m[2])
+				}
+				break
+			}
+		}
+	}
+	if out.Target == "" {
+		for _, part := range strings.Fields(trimmed) {
+			if part == "" || strings.ContainsAny(part, "(){}[];,:/\\") {
+				continue
+			}
+			candidate := strings.Trim(part, "\"'`.")
+			if regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(candidate) {
+				if !isStopWord(candidate) {
+					out.Target = candidate
+					break
+				}
+			}
+		}
+	}
+	if out.Payload == "" {
+		for _, keyword := range []string{"for", "with", "to"} {
+			idx := strings.Index(strings.ToLower(trimmed), keyword)
+			if idx >= 0 {
+				candidate := strings.TrimSpace(trimmed[idx+len(keyword):])
+				candidate = strings.TrimSuffix(candidate, ".")
+				if strings.Contains(candidate, " ") {
+					out.Payload = candidate
+					break
+				}
+			}
+		}
+	}
+	if out.Action == "UNKNOWN" {
+		if strings.Contains(lower, "tag") || strings.Contains(lower, "json") {
+			out.Action = "ADD_TAGS"
+		}
+	}
+	out.Tokens = TokenizePrompt(prompt)
+	return out
+}
+
+func isStopWord(word string) bool {
+	stopWords := map[string]bool{
+		"please": true, "swap": true, "replace": true, "function": true, "fn": true,
+		"method": true, "for": true, "with": true, "to": true, "in": true, "add": true,
+		"inject": true, "annotate": true, "tag": true, "json": true, "struct": true,
+		"model": true, "type": true, "the": true, "a": true, "an": true,
+	}
+	return stopWords[strings.ToLower(word)]
+}
+
+func ResolvePromptTarget(graph *WorkspaceGraph, prompt string) (string, bool) {
+	if graph == nil {
+		return "", false
+	}
+	candidate := ParsePromptSlots(prompt).Target
+	if candidate == "" {
+		for _, token := range TokenizePrompt(prompt) {
+			if token == "" || isStopWord(token) {
+				continue
+			}
+			candidate = token
+			break
+		}
+	}
+	if candidate == "" {
+		return "", false
+	}
+
+	if sym, ok := graph.FindSymbol(candidate); ok {
+		return sym.Name, true
+	}
+	if sym, ok := graph.FindSymbol(strings.Title(candidate)); ok {
+		return sym.Name, true
+	}
+
+	bestName := ""
+	bestDistance := 1000000
+	for _, sym := range graph.Symbols {
+		normSym := normalizeSymbolCandidate(sym.Name)
+		normTarget := normalizeSymbolCandidate(candidate)
+		if normSym == "" || normTarget == "" {
+			continue
+		}
+		dist := levenshteinDistance(normTarget, normSym)
+		if dist < bestDistance {
+			bestDistance = dist
+			bestName = sym.Name
+		}
+	}
+	if bestDistance <= 3 || strings.Contains(strings.ToLower(bestName), strings.ToLower(candidate)) {
+		return bestName, true
+	}
+	return "", false
 }
 
 func splitIdentifier(s string) []string {

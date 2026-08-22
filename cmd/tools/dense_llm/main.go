@@ -611,6 +611,12 @@ func splitFileCommand(raw string) (string, string) {
 func normalizeReplacementFunction(name, replacement string) string {
 	replacement = strings.TrimSpace(replacement)
 	replacement = strings.TrimSpace(strings.TrimSuffix(replacement, "."))
+	for _, prefix := range []string{"for ", "with ", "to "} {
+		if strings.HasPrefix(strings.ToLower(replacement), prefix) {
+			replacement = strings.TrimSpace(replacement[len(prefix):])
+			break
+		}
+	}
 	if replacement == "" {
 		return ""
 	}
@@ -621,6 +627,9 @@ func normalizeReplacementFunction(name, replacement string) string {
 	if idx := strings.Index(replacement, "("); idx > 0 && idx < len(replacement) {
 		prefix := strings.TrimSpace(replacement[:idx])
 		if prefix != "" && regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(prefix) {
+			if name != "" && strings.EqualFold(prefix, name) {
+				replacement = strings.TrimSpace(replacement[idx:])
+			}
 			return "func " + replacement
 		}
 	}
@@ -3715,21 +3724,21 @@ func main() {
 			}
 		}
 
-		// If no -file flag, try resolving from workspace graph.
+		// If no -file flag, resolve the target via the semantic slot parser.
 		if resolvedFile == "" {
-			parsed := dense.ParseHybridPrompt(*oneShot)
-			for _, ident := range parsed.Identifiers {
-				// Try live graph first.
+			slot := dense.ParsePromptWithSlots(*oneShot, wgraph)
+			if slot.TargetSymbol == "" {
+				log.Printf("Could not resolve target symbol from prompt: %q", *oneShot)
+			} else {
 				if wgraph != nil {
-					if sym, ok := wgraph.FindSymbol(ident); ok {
+					if sym, ok := wgraph.FindSymbol(slot.TargetSymbol); ok {
 						resolvedFile = sym.FilePath
-						break
 					}
 				}
-				// Fall back to persistent cache.
-				if fp, _, _, ok := wsCache.FindInCache(ident); ok {
-					resolvedFile = fp
-					break
+				if resolvedFile == "" && wsCache != nil {
+					if fp, _, _, ok := wsCache.FindInCache(slot.TargetSymbol); ok {
+						resolvedFile = fp
+					}
 				}
 			}
 		}
@@ -3745,13 +3754,19 @@ func main() {
 			fset := token.NewFileSet()
 			fileAST, parseErr := parser.ParseFile(fset, resolvedFile, nil, parser.ParseComments)
 			if parseErr == nil {
-				if modified := dense.RouteAndExecute(fileAST, *oneShot); modified {
-					f, createErr := os.Create(resolvedFile)
-					if createErr == nil {
-						defer f.Close()
-						_ = format.Node(f, fset, fileAST)
-						fmt.Printf("Successfully updated %s\n", resolvedFile)
-						os.Exit(0)
+				slot := dense.ParsePromptWithSlots(*oneShot, wgraph)
+				if slot.TargetSymbol == "" {
+					log.Fatalf("Error: Could not resolve target symbol from prompt: %q", *oneShot)
+				}
+				if targetFile, success := dense.RouteAndExecuteWorkspaceWithSlot(wgraph, resolvedFile, slot); success {
+					if targetFile != "" {
+						f, createErr := os.Create(targetFile)
+						if createErr == nil {
+							defer f.Close()
+							_ = format.Node(f, fset, fileAST)
+							fmt.Printf("Successfully updated %s\n", targetFile)
+							os.Exit(0)
+						}
 					}
 				}
 			}
