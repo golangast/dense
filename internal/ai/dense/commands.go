@@ -1,6 +1,10 @@
 package dense
 
-import "strings"
+import (
+	"path/filepath"
+	"regexp"
+	"strings"
+)
 
 // CommandExample is a plain, strongly-typed training example from the basic
 // go_edit_agent update corpus. It covers social prompts as well as file and code
@@ -103,6 +107,13 @@ func ClassifyCommandType(prompt string) string {
 		strings.Contains(lower, "good night") {
 		return "social"
 	}
+	if len(strings.Fields(lower)) <= 2 && !strings.Contains(lower, "function") && !strings.Contains(lower, "struct") &&
+		!strings.Contains(lower, "import") && !strings.Contains(lower, "json") && !strings.Contains(lower, "if ") &&
+		!strings.Contains(lower, "for ") && !strings.Contains(lower, "switch") && !strings.Contains(lower, "return ") &&
+		!strings.Contains(lower, "test") && !strings.Contains(lower, "error") && !strings.Contains(lower, "method") &&
+		!strings.Contains(lower, "brace") && !strings.Contains(lower, "type ") && !strings.Contains(lower, ".go") && !strings.Contains(lower, "into") {
+		return "social"
+	}
 	if strings.Contains(lower, "create file") || strings.Contains(lower, "new file") ||
 		(strings.Contains(lower, "create") && strings.Contains(lower, "file")) {
 		return "file_create"
@@ -134,12 +145,16 @@ func ClassifyCommandType(prompt string) string {
 		(strings.Contains(lower, "remove") && (strings.Contains(lower, "folder") || strings.Contains(lower, "directory"))) {
 		return "folder_delete"
 	}
-	if strings.Contains(lower, "create function") || strings.Contains(lower, "create struct") ||
+	if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") ||
+		strings.Contains(lower, "rename ") && strings.Contains(lower, " to ") ||
+		strings.Contains(lower, "create function") || strings.Contains(lower, "create struct") ||
 		strings.Contains(lower, "create type") || strings.Contains(lower, "add function") ||
 		strings.Contains(lower, "modify function") || strings.Contains(lower, "edit function") ||
 		strings.Contains(lower, "update function") || strings.Contains(lower, "delete function") ||
 		strings.Contains(lower, "remove function") || strings.Contains(lower, "return ") ||
-		strings.Contains(lower, "add opening brace") || strings.Contains(lower, "add missing") {
+		strings.Contains(lower, "add opening brace") || strings.Contains(lower, "add missing") ||
+		strings.Contains(lower, "json tag") || strings.Contains(lower, "json tags") ||
+		(strings.Contains(lower, "import ") && (strings.Contains(lower, " from ") || strings.Contains(lower, " to ") || strings.Contains(lower, " into "))) {
 		return "code_update"
 	}
 	return "social"
@@ -152,15 +167,39 @@ func inferTargetFromPrompt(prompt string) (string, string) {
 		return "", ""
 	}
 
+	lowerPrompt := strings.ToLower(prompt)
+	if strings.Contains(lowerPrompt, "into file ") || strings.Contains(lowerPrompt, "into ") {
+		for _, key := range []string{"into file ", "into "} {
+			if idx := strings.Index(lowerPrompt, key); idx >= 0 {
+				target := strings.TrimSpace(prompt[idx+len(key):])
+				if match := regexp.MustCompile(`(?i)(?:file\s+)?([A-Za-z0-9_./\-]+\.go)`).FindStringSubmatch(target); len(match) > 1 {
+					return filepath.Clean(match[1]), "file"
+				}
+			}
+		}
+	}
+
 	for i, token := range fields {
 		switch strings.ToLower(token) {
 		case "file", "/file":
 			if i+1 < len(fields) {
-				return strings.Join(fields[i+1:], " "), "file"
+				candidate := strings.TrimSpace(fields[i+1])
+				if candidate == "" {
+					continue
+				}
+				if filepath.Ext(candidate) == ".go" || strings.Contains(candidate, "/") || strings.Contains(candidate, "\\") {
+					return candidate, "file"
+				}
 			}
 		case "folder", "/folder", "directory", "/directory":
 			if i+1 < len(fields) {
-				return strings.Join(fields[i+1:], " "), "folder"
+				candidate := strings.TrimSpace(fields[i+1])
+				if candidate == "" {
+					continue
+				}
+				if strings.Contains(candidate, "/") || strings.Contains(candidate, "\\") || filepath.Ext(candidate) != "" {
+					return candidate, "folder"
+				}
 			}
 		}
 	}
@@ -171,7 +210,16 @@ func inferTargetFromPrompt(prompt string) (string, string) {
 			continue
 		}
 		if i+1 < len(fields) {
-			return strings.Join(fields[i+1:], " "), lower
+			candidate := strings.TrimSpace(fields[i+1])
+			if candidate == "" {
+				continue
+			}
+			if lower == "file" && (filepath.Ext(candidate) == ".go" || strings.Contains(candidate, "/") || strings.Contains(candidate, "\\")) {
+				return candidate, lower
+			}
+			if lower != "file" && (strings.Contains(candidate, "/") || strings.Contains(candidate, "\\") || filepath.Ext(candidate) != "") {
+				return candidate, lower
+			}
 		}
 	}
 

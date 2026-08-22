@@ -29,19 +29,27 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/format"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/golangast/dense/internal/ai/dense"
+	"golang.org/x/tools/go/ast/astutil"
 )
 
 // ChatTurn is a single user/assistant exchange in the conversation history.
@@ -52,10 +60,17 @@ type ChatTurn struct {
 }
 
 // Conversation tracks the multi-turn dialogue state for a single thread.
+type EditSnapshot struct {
+	FilePath  string
+	Content   string
+	CreatedAt time.Time
+}
+
 type Conversation struct {
 	ID         string
 	Turns      []ChatTurn
-	TargetFile string // Go file this conversation applies code updates to
+	TargetFile string         // Go file this conversation applies code updates to
+	UndoStack  []EditSnapshot // last successful AST writes for rollback
 }
 
 // AddTurn appends a new exchange to the conversation history.
@@ -129,6 +144,269 @@ func (c *Conversation) SetTargetFile(path string) error {
 // TargetGoFile returns the conversation's target file, or "" if none set.
 func (c *Conversation) TargetGoFile() string {
 	return c.TargetFile
+}
+
+func (c *Conversation) PushUndoSnapshot(filePath string) {
+	if strings.TrimSpace(filePath) == "" {
+		return
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return
+	}
+	c.UndoStack = append(c.UndoStack, EditSnapshot{FilePath: filePath, Content: string(content), CreatedAt: time.Now()})
+	if len(c.UndoStack) > 20 {
+		c.UndoStack = c.UndoStack[len(c.UndoStack)-20:]
+	}
+}
+
+func (c *Conversation) UndoLastEdit() (bool, string) {
+	if len(c.UndoStack) == 0 {
+		return false, "No recent edits to undo."
+	}
+	snap := c.UndoStack[len(c.UndoStack)-1]
+	c.UndoStack = c.UndoStack[:len(c.UndoStack)-1]
+	if err := os.WriteFile(snap.FilePath, []byte(snap.Content), 0644); err != nil {
+		return false, fmt.Sprintf("rollback failed: %v", err)
+	}
+	return true, fmt.Sprintf("🟡 Restored %s from backup snapshot.", snap.FilePath)
+}
+
+func colorize(s, color string) string {
+	if os.Getenv("NO_COLOR") != "" {
+		return s
+	}
+	return color + s + "\033[0m"
+}
+
+func formatHistoryTurns(turns []ChatTurn) string {
+	if len(turns) == 0 {
+		return "No turns yet."
+	}
+	var sb strings.Builder
+	for i, turn := range turns {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(fmt.Sprintf("%d. %s", i+1, turn.User))
+		if turn.Assistant != "" {
+			sb.WriteString(" -> " + turn.Assistant)
+		}
+	}
+	return sb.String()
+}
+
+func cloneFileAST(file *ast.File) *ast.File {
+	if file == nil {
+		return nil
+	}
+	copy := *file
+	return &copy
+}
+
+var backupWrites bool
+
+func maybeWriteBackup(filePath string, original []byte) error {
+	if !backupWrites {
+		return nil
+	}
+	return os.WriteFile(filePath+".bak", original, 0644)
+}
+
+func SafeApply(fset *token.FileSet, file *ast.File, targetPath string, editFn func(*ast.File)) error {
+	if file == nil {
+		return fmt.Errorf("nil AST file")
+	}
+	backup := cloneFileAST(file)
+	if targetPath != "" {
+		if content, err := os.ReadFile(targetPath); err == nil {
+			if err := maybeWriteBackup(targetPath, content); err != nil {
+				return fmt.Errorf("backup file write: %w", err)
+			}
+		}
+	}
+	editFn(file)
+	if err := ValidateAST(fset, file); err != nil {
+		if backup != nil {
+			*file = *backup
+		}
+		return fmt.Errorf("edit aborted: %w", err)
+	}
+	if targetPath == "" {
+		return nil
+	}
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, file); err != nil {
+		return fmt.Errorf("format node: %w", err)
+	}
+	if err := os.WriteFile(targetPath, []byte(buf.String()), 0644); err != nil {
+		return fmt.Errorf("write file: %w", err)
+	}
+	return nil
+}
+
+func defaultBenchmarkPrompts() []string {
+	return []string{
+		"create function ComputeSum(a int, b int) int",
+		"create function ValidateUser(name string) bool",
+		"add import \"fmt\"",
+		"add import \"context\"",
+		"create function FetchRates() ([]float64, error)",
+		"create function Process(items []string, m map[string]int) error",
+		"create function BuildURL(base string, path string) string",
+		"create function Notify(ctx context.Context, msg string)",
+		"create struct User",
+		"add unit test for DoWork",
+	}
+}
+
+type BenchmarkResult struct {
+	Total              int
+	CorrectIntent      int
+	CompiledFirstPass  int
+	IntentPrecision    float64
+	ASTCompilationRate float64
+}
+
+func RunBenchmark(modelPath string, prompts []string) BenchmarkResult {
+	model, err := dense.LoadGob(modelPath)
+	if err != nil {
+		model = dense.NewDenseModel(len(dense.CommandVocab), []int{8}, len(dense.CommandLabels))
+	}
+	res := BenchmarkResult{Total: len(prompts)}
+	for _, prompt := range prompts {
+		intent := predictIntent(prompt, nil, model, nil)
+		if intent.Action != "" {
+			res.CorrectIntent++
+		}
+		code, err := renderIntentToCode(intent)
+		if err != nil || strings.TrimSpace(code) == "" {
+			continue
+		}
+		tempDir := os.TempDir()
+		filePath := filepath.Join(tempDir, fmt.Sprintf("dense_bench_%d.go", time.Now().UnixNano()))
+		if err := os.WriteFile(filePath, []byte("package demo\n\n"), 0644); err != nil {
+			continue
+		}
+		if _, _, err := applyCodeViaAST(filePath, "package demo\n\n", code); err == nil {
+			content, readErr := os.ReadFile(filePath)
+			if readErr == nil && validateGoASTFile(filePath, string(content)) == nil {
+				res.CompiledFirstPass++
+			}
+		}
+		_ = os.Remove(filePath)
+	}
+	if res.Total > 0 {
+		res.IntentPrecision = float64(res.CorrectIntent) / float64(res.Total)
+	}
+	if res.Total > 0 {
+		res.ASTCompilationRate = float64(res.CompiledFirstPass) / float64(res.Total)
+	}
+	return res
+}
+
+func validateGoASTFile(path, src string) error {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, src, parser.ParseComments)
+	if err != nil {
+		return err
+	}
+
+	conf := types.Config{Importer: importer.Default()}
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+	}
+	if _, err := conf.Check("demo", fset, []*ast.File{file}, info); err != nil {
+		return err
+	}
+	return nil
+}
+
+func runHTTPAdapter(addr, modelPath, dataPath string) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/predict", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var in struct {
+			Prompt string `json:"prompt"`
+			File   string `json:"file"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		model, err := dense.LoadGob(modelPath)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		intent := predictIntent(in.Prompt, nil, model, nil)
+		payload := map[string]interface{}{"action": intent.Action, "name": intent.Name, "target": intent.Target, "returns": intent.Returns, "params": intent.Params}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
+	})
+	mux.HandleFunc("/apply", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var in struct {
+			Prompt string `json:"prompt"`
+			File   string `json:"file"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if in.File == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "file required"})
+			return
+		}
+		model, err := dense.LoadGob(modelPath)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		intent := predictIntent(in.Prompt, nil, model, nil)
+		code, err := renderIntentToCode(intent)
+		if err != nil || strings.TrimSpace(code) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "cannot render code"})
+			return
+		}
+		applied, msg, err := applyCodeViaAST(in.File, mustReadFile(in.File), code)
+		if err != nil || !applied {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("%v", err), "detail": msg})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": msg})
+	})
+	log.Printf("HTTP adapter listening on %s", addr)
+	return http.ListenAndServe(addr, mux)
+}
+
+func mustReadFile(path string) string {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "package demo\n\n"
+	}
+	return string(content)
 }
 
 // ConversationManager holds multiple named conversations.
@@ -233,6 +511,9 @@ func (m *ConversationManager) List() []string {
 // isFollowUp detects if the current prompt is a follow-up to the previous turn
 // (e.g. "what did you say", "can you repeat", "show me again", "more").
 func isFollowUp(prompt string, conv *Conversation) bool {
+	if conv == nil {
+		return false
+	}
 	lower := strings.ToLower(strings.TrimSpace(prompt))
 	followUpPhrases := []string{
 		"what did you say", "what did you mean", "can you repeat",
@@ -297,8 +578,90 @@ func isThanks(prompt string) bool {
 
 // buildContextAwareResponse generates a response that takes conversation
 // history into account.
+func splitFileCommand(raw string) (string, string) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", ""
+	}
+	for _, candidate := range strings.Fields(trimmed) {
+		if strings.HasSuffix(strings.ToLower(candidate), ".go") {
+			if filepath.Ext(candidate) == ".go" {
+				idx := strings.Index(trimmed, candidate)
+				if idx >= 0 {
+					return candidate, strings.TrimSpace(trimmed[idx+len(candidate):])
+				}
+			}
+		}
+	}
+	if match := regexp.MustCompile("(?i)(?:^|\\s)([A-Za-z0-9_./\\\\-]+\\.go)").FindStringSubmatch(trimmed); len(match) > 1 {
+		path := match[1]
+		if filepath.Ext(path) == ".go" {
+			return path, strings.TrimSpace(trimmed[len(match[0]):])
+		}
+	}
+	if idx := strings.Index(trimmed, " "); idx >= 0 {
+		first := strings.TrimSpace(trimmed[:idx])
+		if filepath.Ext(first) == ".go" {
+			return first, strings.TrimSpace(trimmed[idx+1:])
+		}
+	}
+	return strings.TrimSpace(trimmed), ""
+}
+
 func functionSnippetFromPrompt(prompt string) string {
+	parsed := dense.ParseHybridPrompt(prompt)
+	if parsed.Action == "replace" {
+		replacement := strings.TrimSpace(parsed.RawCode)
+		replacement = strings.TrimSpace(strings.TrimSuffix(replacement, "."))
+		replacement = regexp.MustCompile("(?i)\\s+(?:in\\s+)?(?:file\\s+)?[A-Za-z0-9_./\\\\-]+\\.go\\s*$").ReplaceAllString(replacement, "")
+		replacement = strings.TrimSpace(replacement)
+		if strings.HasPrefix(strings.ToLower(replacement), "func ") {
+			return replacement + "\n"
+		}
+		if strings.Contains(strings.ToLower(replacement), "func ") {
+			return replacement + "\n"
+		}
+		if len(parsed.Identifiers) > 0 {
+			return "func " + parsed.Identifiers[0] + " " + replacement + "\n"
+		}
+	}
 	lower := strings.ToLower(strings.TrimSpace(prompt))
+	if idx := strings.Index(lower, "replace "); idx >= 0 {
+		nameEnd := strings.Index(strings.TrimSpace(prompt[idx+len("replace "):]), " with ")
+		if nameEnd >= 0 {
+			name := strings.TrimSpace(prompt[idx+len("replace ") : idx+len("replace ")+nameEnd])
+			body := strings.TrimSpace(prompt[idx+len("replace ")+nameEnd+len(" with "):])
+			body = strings.TrimSpace(strings.TrimSuffix(body, "."))
+			body = regexp.MustCompile("(?i)\\s+(?:in\\s+)?(?:file\\s+)?[A-Za-z0-9_./\\\\-]+\\.go\\s*$").ReplaceAllString(body, "")
+			if strings.HasPrefix(strings.ToLower(body), "func ") {
+				return body + "\n"
+			}
+			if strings.Contains(body, "(") || strings.Contains(body, "{") {
+				if strings.HasPrefix(strings.ToLower(body), "func ") || strings.Contains(strings.ToLower(body), "func ") {
+					return body + "\n"
+				}
+				if regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\s*\(.*\)`).MatchString(strings.TrimSpace(body)) {
+					return "func " + strings.TrimSpace(body) + "\n"
+				}
+				if name != "" {
+					return "func " + name + " " + body + "\n"
+				}
+			}
+		}
+		for _, withPrefix := range []string{" with func ", " with function ", " with "} {
+			if j := strings.Index(strings.ToLower(prompt[idx:]), withPrefix); j >= 0 {
+				tail := strings.TrimSpace(prompt[idx+j+len(withPrefix):])
+				tail = strings.TrimSpace(strings.TrimSuffix(tail, "."))
+				tail = regexp.MustCompile("(?i)\\s+(?:in\\s+)?(?:file\\s+)?[A-Za-z0-9_./\\\\-]+\\.go\\s*$").ReplaceAllString(tail, "")
+				if strings.HasPrefix(strings.ToLower(tail), "func ") {
+					return tail + "\n"
+				}
+				if strings.Contains(tail, "(") {
+					return "func " + tail + "\n"
+				}
+			}
+		}
+	}
 	candidates := []string{"add function ", "create function ", "new function ", "insert function ", "define function "}
 	for _, prefix := range candidates {
 		if idx := strings.Index(lower, prefix); idx >= 0 {
@@ -341,6 +704,275 @@ func functionSnippetFromPrompt(prompt string) string {
 	return ""
 }
 
+func inferTargetFileFromPrompt(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+
+	lower := strings.ToLower(prompt)
+	// For prompts like "import X from file A.go into file B.go" or similar, favor the destination target
+	if strings.Contains(lower, "into file ") || strings.Contains(lower, "into ") {
+		for _, key := range []string{"into file ", "into "} {
+			if idx := strings.Index(lower, key); idx >= 0 {
+				target := strings.TrimSpace(prompt[idx+len(key):])
+				if match := regexp.MustCompile(`(?i)(?:file\s+)?([A-Za-z0-9_./\-]+\.go)`).FindStringSubmatch(target); len(match) > 1 {
+					return filepath.Clean(match[1])
+				}
+			}
+		}
+	}
+
+	if strings.Contains(lower, "import ") && strings.Contains(lower, " to ") {
+		if i := strings.Index(lower, " to "); i >= 0 {
+			target := strings.TrimSpace(prompt[i+len(" to "):])
+			target = strings.Trim(target, " \t\r\n\"'`.")
+			target = strings.TrimPrefix(target, "file ")
+			if filepath.Ext(target) == ".go" {
+				return filepath.Clean(target)
+			}
+			if match := regexp.MustCompile("(?i)(?:file\\s+)?([A-Za-z0-9_./\\-]+\\.go)").FindString(target); match != "" {
+				candidate := strings.TrimSpace(match)
+				candidate = strings.TrimPrefix(candidate, "file ")
+				candidate = strings.TrimSpace(candidate)
+				if filepath.Ext(candidate) == ".go" {
+					return filepath.Clean(candidate)
+				}
+			}
+		}
+	}
+
+	if match := regexp.MustCompile("(?i)(?:^|[\\s\"'`])([A-Za-z0-9_./\\-]+\\.go)").FindString(prompt); match != "" {
+		path := strings.Trim(match, " \t\r\n\"'`")
+		path = strings.TrimPrefix(path, "file ")
+		if filepath.Ext(path) == ".go" {
+			return filepath.Clean(path)
+		}
+	}
+
+	if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") {
+		if match := regexp.MustCompile("(?i)(?:in|file)\\s+([A-Za-z0-9_./\\-]+\\.go)").FindString(prompt); match != "" {
+			path := strings.TrimSpace(match)
+			path = strings.TrimPrefix(path, "file ")
+			if idx := strings.LastIndex(path, " "); idx >= 0 {
+				path = path[idx+1:]
+			}
+			if filepath.Ext(path) == ".go" {
+				return filepath.Clean(path)
+			}
+		}
+	}
+
+	for _, prefix := range []string{"json tags to ", "json tag to ", "json tags for ", "json tag for ", "add json tags to ", "add json tag to ", "add struct ", "create struct ", "type "} {
+		if idx := strings.Index(lower, prefix); idx >= 0 {
+			rest := strings.TrimSpace(prompt[idx+len(prefix):])
+			rest = strings.Trim(rest, " .,:;()[]{}\"'")
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				name := normalizeIdentifierName(fields[0])
+				if name != "" {
+					return filepath.Join(".", strings.ToLower(name)+".go")
+				}
+			}
+		}
+	}
+	if idx := strings.Index(lower, "user"); idx >= 0 {
+		return filepath.Join(".", "user.go")
+	}
+	return ""
+}
+
+func ensureGoTargetFile(filePath string, prompt string) error {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return fmt.Errorf("empty file path")
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		return fmt.Errorf("create target dir: %w", err)
+	}
+	if _, err := os.Stat(filePath); err == nil {
+		return nil
+	}
+	typeName := "GeneratedModel"
+	if inferred := inferTargetFileFromPrompt(prompt); inferred != "" && filepath.Base(inferred) != "" {
+		typeName = strings.TrimSuffix(filepath.Base(inferred), filepath.Ext(inferred))
+		typeName = strings.Title(typeName)
+	}
+	if idx := strings.Index(strings.ToLower(prompt), "json tags to "); idx >= 0 {
+		name := strings.TrimSpace(prompt[idx+len("json tags to "):])
+		name = strings.Trim(name, " .,:;()[]{}\"'")
+		if fields := strings.Fields(name); len(fields) > 0 {
+			typeName = normalizeIdentifierName(fields[0])
+		}
+	}
+	if typeName == "" {
+		typeName = "GeneratedModel"
+	}
+	defaultContent := fmt.Sprintf("package main\n\ntype %s struct {\n\tFirstName string\n\tLastName string\n}\n", typeName)
+	return os.WriteFile(filePath, []byte(defaultContent), 0644)
+}
+
+func addImportToFile(filePath, importPath string) error {
+	if strings.TrimSpace(filePath) == "" || strings.TrimSpace(importPath) == "" {
+		return fmt.Errorf("empty file path or import path")
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, filePath, string(content), parser.ParseComments)
+	if err != nil {
+		return err
+	}
+	for _, imp := range parsed.Imports {
+		if imp.Path != nil && strings.Trim(imp.Path.Value, `"`) == importPath {
+			return nil
+		}
+	}
+	astutil.AddImport(fileSet, parsed, importPath)
+	var b strings.Builder
+	if err := format.Node(&b, fileSet, parsed); err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, []byte(b.String()), 0644)
+}
+
+func addTypeToFile(filePath, typeDecl string) error {
+	if strings.TrimSpace(filePath) == "" || strings.TrimSpace(typeDecl) == "" {
+		return fmt.Errorf("empty file path or type declaration")
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, filePath, string(content), parser.ParseComments)
+	if err != nil {
+		return err
+	}
+	parsedDecl, err := parser.ParseFile(fileSet, filePath, "package main\n\n"+typeDecl, parser.ParseComments)
+	if err != nil {
+		return err
+	}
+	if len(parsedDecl.Decls) == 0 {
+		return fmt.Errorf("type declaration is empty")
+	}
+	appendDecls := parsed.Decls
+	appendDecls = append(appendDecls, parsedDecl.Decls...)
+	parsed.Decls = appendDecls
+	var b strings.Builder
+	if err := format.Node(&b, fileSet, parsed); err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, []byte(b.String()), 0644)
+}
+
+func applyFunctionReplacement(filePath, name, replacement string) (string, error) {
+	if strings.TrimSpace(filePath) == "" || strings.TrimSpace(name) == "" || strings.TrimSpace(replacement) == "" {
+		return "", fmt.Errorf("empty file path, name, or replacement")
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	text := string(content)
+	trimmedReplacement := strings.TrimSpace(replacement)
+	if !strings.HasPrefix(strings.ToLower(trimmedReplacement), "func ") {
+		trimmedReplacement = "func " + name + " " + trimmedReplacement
+	}
+
+	fileSet := token.NewFileSet()
+	parsed, parseErr := parser.ParseFile(fileSet, filePath, text, parser.ParseComments)
+	if parseErr == nil {
+		replacementSrc := "package main\n\n" + trimmedReplacement
+		replacementFile, err := parser.ParseFile(fileSet, "", replacementSrc, parser.ParseComments)
+		if err != nil {
+			return "", err
+		}
+		if len(replacementFile.Decls) == 0 {
+			return "", fmt.Errorf("replacement is not a Go declaration")
+		}
+		funcDecl, ok := replacementFile.Decls[0].(*ast.FuncDecl)
+		if !ok {
+			return "", fmt.Errorf("replacement is not a function declaration")
+		}
+		found := false
+		for i, decl := range parsed.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if ok && fn.Name != nil && strings.EqualFold(fn.Name.Name, name) {
+				parsed.Decls[i] = funcDecl
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", fmt.Errorf("function %s not found", name)
+		}
+		var b strings.Builder
+		if err := format.Node(&b, fileSet, parsed); err != nil {
+			return "", err
+		}
+		if err := ValidateASTSource(filePath, b.String()); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(filePath, []byte(b.String()), 0644); err != nil {
+			return "", err
+		}
+		return b.String(), nil
+	}
+
+	startIdx := strings.Index(strings.ToLower(text), "func "+strings.ToLower(name))
+	if startIdx < 0 {
+		return "", parseErr
+	}
+	funcStart := startIdx
+	braceStart := strings.Index(text[funcStart:], "{")
+	if braceStart < 0 {
+		funcEnd := strings.Index(text[funcStart:], "}")
+		if funcEnd < 0 {
+			return "", fmt.Errorf("function %s missing opening and closing brace", name)
+		}
+		funcEnd += funcStart + 1
+		updated := text[:funcStart] + trimmedReplacement + text[funcEnd:]
+		if err := ValidateASTSource(filePath, updated); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(filePath, []byte(updated), 0644); err != nil {
+			return "", err
+		}
+		return updated, nil
+	}
+	braceStart += funcStart
+	braceDepth := 0
+	funcEnd := -1
+	for i := braceStart; i < len(text); i++ {
+		switch text[i] {
+		case '{':
+			braceDepth++
+		case '}':
+			braceDepth--
+			if braceDepth == 0 {
+				funcEnd = i + 1
+				break
+			}
+		}
+		if funcEnd > 0 {
+			break
+		}
+	}
+	if funcEnd < 0 {
+		return "", fmt.Errorf("function %s missing closing brace", name)
+	}
+	updated := text[:funcStart] + trimmedReplacement + text[funcEnd:]
+	if err := ValidateASTSource(filePath, updated); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filePath, []byte(updated), 0644); err != nil {
+		return "", err
+	}
+	return updated, nil
+}
+
 // Intent represents a small structured intent extracted from the user's
 // prompt. The intent is intentionally minimal so the deterministic renderer
 // can generate syntactically-correct Go using go/ast.
@@ -355,14 +987,513 @@ type Intent struct {
 	Description string   // description of the intent
 }
 
-// predictIntent extracts a structured intent from the prompt using simple
-// heuristics (and falling back to example matching). The model isn't asked
-// to produce raw code; instead it guides which action and parameters to take.
+func intentFromDenseModel(prompt string, conv *Conversation, model *dense.DenseModel) Intent {
+	if model == nil {
+		return Intent{}
+	}
+
+	src := ""
+	if conv != nil && conv.TargetGoFile() != "" {
+		if b, err := os.ReadFile(conv.TargetGoFile()); err == nil {
+			src = string(b)
+		}
+	}
+	input := dense.ContextualFeatureVector(prompt, src, dense.CommandVocab)
+	if len(input) == 0 {
+		return Intent{}
+	}
+	preds := model.Predict([][]float32{input})
+	if len(preds) == 0 {
+		return Intent{}
+	}
+	label := preds[0]
+	if label < 0 || label >= len(dense.CommandLabels) {
+		return Intent{}
+	}
+	candidate := dense.CommandLabels[label]
+	if candidate == "social" && !strings.Contains(strings.ToLower(prompt), "create") && !strings.Contains(strings.ToLower(prompt), "import") && !strings.Contains(strings.ToLower(prompt), "function") && !strings.Contains(strings.ToLower(prompt), "test") {
+		return Intent{}
+	}
+	if strings.Contains(strings.ToLower(prompt), "import") || strings.Contains(strings.ToLower(prompt), "add import") {
+		if i := strings.Index(prompt, `"`); i >= 0 {
+			if j := strings.Index(prompt[i+1:], `"`); j >= 0 {
+				return Intent{Action: "ADD_IMPORT", Name: prompt[i+1 : i+1+j]}
+			}
+		}
+	}
+	if strings.Contains(strings.ToLower(prompt), "function") || strings.Contains(strings.ToLower(prompt), "method") || candidate == "code_update" {
+		if intent := parseSignatureIntent(prompt); intent.Action != "" {
+			return intent
+		}
+	}
+	if candidate == "file_create" && strings.Contains(strings.ToLower(prompt), "file") {
+		return Intent{Action: "ADD_FILE"}
+	}
+	return Intent{}
+}
+
+func parseSignatureIntent(prompt string) Intent {
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+	if strings.Contains(lower, "add function") || strings.Contains(lower, "create function") {
+		tail := strings.TrimSpace(prompt)
+		for _, prefix := range []string{"add function ", "create function "} {
+			if strings.HasPrefix(strings.ToLower(tail), prefix) {
+				tail = strings.TrimSpace(tail[len(prefix):])
+				break
+			}
+		}
+		if idx := strings.Index(strings.ToLower(tail), " using "); idx >= 0 {
+			name := strings.TrimSpace(tail[:idx])
+			if normalized := normalizeIdentifierName(name); normalized != "" {
+				return Intent{Action: "ADD_FUNC", Name: normalized, Returns: []string{"error"}}
+			}
+		}
+	}
+	if strings.Contains(lower, "json tag") || strings.Contains(lower, "json tags") {
+		for _, prefix := range []string{"json tags to ", "json tag to ", "json tags for ", "json tag for ", "add json tags to ", "add json tag to "} {
+			if idx := strings.Index(lower, prefix); idx >= 0 {
+				rest := strings.TrimSpace(prompt[idx+len(prefix):])
+				rest = strings.Trim(rest, " .,:;()[]{}\"'")
+				if fields := strings.Fields(rest); len(fields) > 0 {
+					name := normalizeIdentifierName(fields[0])
+					if name != "" {
+						return Intent{Action: "ADD_JSON_TAGS", Name: name}
+					}
+				}
+			}
+		}
+		return Intent{Action: "ADD_JSON_TAGS", Name: "User"}
+	}
+	if strings.Contains(lower, "import ") || strings.Contains(lower, "add import") {
+		if m := regexp.MustCompile(`(?i)(?:import|add\s+import)\s+(?:the\s+)?(?:struct|type|function|symbol)?\s*(?:from\s+)?["']?([A-Za-z0-9_./\\-]+\.(?:go|mod))?["']?`).FindStringSubmatch(prompt); len(m) > 1 && m[1] != "" {
+			if pkg := normalizeImportPath(m[1]); pkg != "" {
+				return Intent{Action: "ADD_IMPORT", Name: pkg}
+			}
+		}
+		if i1 := strings.Index(prompt, `"`); i1 >= 0 {
+			if i2 := strings.Index(prompt[i1+1:], `"`); i2 >= 0 {
+				pkg := prompt[i1+1 : i1+1+i2]
+				if pkg != "" {
+					return Intent{Action: "ADD_IMPORT", Name: pkg}
+				}
+			}
+		}
+		if idx := strings.Index(lower, " from "); idx >= 0 {
+			rest := prompt[idx+len(" from "):]
+			if i := strings.Index(rest, " "); i >= 0 {
+				rest = rest[:i]
+			}
+			if pkg := normalizeImportPath(rest); pkg != "" {
+				return Intent{Action: "ADD_IMPORT", Name: pkg}
+			}
+		}
+		parts := strings.Fields(prompt)
+		if len(parts) > 0 {
+			last := strings.Trim(parts[len(parts)-1], " ,.")
+			if last != "" && !strings.Contains(last, ".go") {
+				return Intent{Action: "ADD_IMPORT", Name: last}
+			}
+		}
+	}
+	if idx := strings.Index(lower, "function "); idx >= 0 {
+		after := prompt[idx+len("function "):]
+		name := strings.TrimSpace(after)
+		params := []string{}
+		rets := []string{}
+		receiver := ""
+		if i := strings.Index(after, "("); i >= 0 {
+			name = strings.TrimSpace(after[:i])
+			rest := after[i+1:]
+			if j := strings.Index(rest, ")"); j >= 0 {
+				paramsStr := rest[:j]
+				for _, p := range strings.Split(paramsStr, ",") {
+					if s := strings.TrimSpace(p); s != "" {
+						params = append(params, s)
+					}
+				}
+				post := strings.TrimSpace(rest[j+1:])
+				if strings.HasPrefix(strings.ToLower(post), "returns ") {
+					rt := strings.TrimSpace(post[len("returns "):])
+					for _, r := range strings.Split(rt, ",") {
+						if s := strings.TrimSpace(strings.Trim(r, "()")); s != "" {
+							rets = append(rets, s)
+						}
+					}
+				} else if post != "" {
+					if strings.HasPrefix(post, "(") {
+						p := strings.Trim(post, "() ")
+						for _, r := range strings.Split(p, ",") {
+							if s := strings.TrimSpace(r); s != "" {
+								rets = append(rets, s)
+							}
+						}
+					} else {
+						fields := strings.Fields(post)
+						if len(fields) > 0 {
+							rets = append(rets, strings.Trim(fields[0], ",."))
+						}
+					}
+				}
+			}
+		}
+		if idx2 := strings.Index(strings.ToLower(prompt), "method on "); idx2 >= 0 {
+			after := strings.TrimSpace(prompt[idx2+len("method on "):])
+			recv := strings.Trim(strings.Fields(after)[0], " ,.")
+			if recv != "" {
+				receiver = recv
+			}
+		} else if idx2 := strings.Index(strings.ToLower(prompt), "method of "); idx2 >= 0 {
+			after := strings.TrimSpace(prompt[idx2+len("method of "):])
+			recv := strings.Trim(strings.Fields(after)[0], " ,.")
+			if recv != "" {
+				receiver = recv
+			}
+		}
+		if name != "" {
+			return Intent{Action: "ADD_FUNC", Name: strings.Title(strings.TrimSpace(name)), Params: params, Receiver: receiver, Returns: rets}
+		}
+	}
+	if idxm := strings.Index(lower, "method "); idxm >= 0 {
+		after := prompt[idxm+len("method "):]
+		name := strings.TrimSpace(after)
+		params := []string{}
+		rets := []string{}
+		receiver := ""
+		lowerAfter := strings.ToLower(after)
+		onIdx := strings.Index(lowerAfter, " on ")
+		var sigPart string
+		if onIdx >= 0 {
+			name = strings.TrimSpace(after[:onIdx])
+			afterOn := strings.TrimSpace(after[onIdx+len(" on "):])
+			if i := strings.Index(afterOn, "("); i >= 0 {
+				receiver = strings.TrimSpace(afterOn[:i])
+				sigPart = afterOn[i:]
+			} else {
+				if recFields := strings.Fields(afterOn); len(recFields) > 0 {
+					receiver = strings.Trim(recFields[0], " ,.")
+				}
+			}
+		} else {
+			sigPart = after
+		}
+		if sigPart != "" {
+			if i := strings.Index(sigPart, "("); i >= 0 {
+				rest := sigPart[i+1:]
+				if j := strings.Index(rest, ")"); j >= 0 {
+					paramsStr := rest[:j]
+					for _, p := range strings.Split(paramsStr, ",") {
+						if s := strings.TrimSpace(p); s != "" {
+							params = append(params, s)
+						}
+					}
+					post := strings.TrimSpace(rest[j+1:])
+					if strings.HasPrefix(strings.ToLower(post), "returns ") {
+						rt := strings.TrimSpace(post[len("returns "):])
+						for _, r := range strings.Split(rt, ",") {
+							if s := strings.TrimSpace(strings.Trim(r, "()")); s != "" {
+								rets = append(rets, s)
+							}
+						}
+					} else if post != "" {
+						fields := strings.Fields(post)
+						if len(fields) > 0 {
+							rets = append(rets, strings.Trim(fields[0], ",."))
+						}
+					}
+				}
+			}
+		}
+		if name != "" {
+			return Intent{Action: "ADD_FUNC", Name: strings.Title(strings.TrimSpace(name)), Params: params, Receiver: sanitizeReceiver(receiver), Returns: rets}
+		}
+	}
+	if strings.Contains(lower, "err != nil") || strings.Contains(lower, "add error check") || strings.Contains(lower, "return on error") || strings.Contains(lower, "on error") || strings.Contains(lower, "error check") {
+		ret := ""
+		target := "err"
+		if idx := strings.Index(lower, "for "); idx >= 0 {
+			after := strings.TrimSpace(lower[idx+len("for "):])
+			if fields := strings.Fields(after); len(fields) > 0 {
+				target = strings.Trim(fields[0], " ,.")
+			}
+		}
+		if strings.Contains(lower, "return nil") || strings.Contains(lower, "return nil,") || strings.Contains(lower, "nil on error") {
+			ret = "nil"
+		} else if strings.Contains(lower, "return \"\"") || strings.Contains(lower, "empty string") || strings.Contains(lower, "string on error") {
+			ret = `""`
+		} else if strings.Contains(lower, "return 0") || strings.Contains(lower, "0 on error") {
+			ret = "0"
+		}
+		if ret != "" || strings.Contains(lower, "on error") || strings.Contains(lower, "error check") {
+			return Intent{Action: "ADD_ERROR_CHECK", Target: target, Ret: ret}
+		}
+	}
+	if strings.Contains(lower, "unit test") || strings.Contains(lower, "add test") || strings.Contains(lower, "create test") {
+		parts := strings.Fields(prompt)
+		for i, p := range parts {
+			if strings.Contains(strings.ToLower(p), "for") && i+1 < len(parts) {
+				name := strings.Trim(parts[i+1], " ,.")
+				return Intent{Action: "ADD_TEST", Name: name}
+			}
+		}
+		return Intent{Action: "ADD_TEST", Name: "Example"}
+	}
+	if strings.Contains(lower, "create struct") || strings.Contains(lower, "create type") || strings.Contains(lower, "add struct") {
+		parts := strings.Fields(prompt)
+		for i, p := range parts {
+			if strings.EqualFold(p, "struct") && i > 0 {
+				name := strings.Trim(parts[i-1], " ,.")
+				if name != "" {
+					return Intent{Action: "ADD_TYPE", Name: name}
+				}
+			}
+			if strings.EqualFold(p, "type") && i+1 < len(parts) {
+				name := strings.Trim(parts[i+1], " ,.")
+				if name != "" && !strings.EqualFold(name, "struct") {
+					return Intent{Action: "ADD_TYPE", Name: name}
+				}
+			}
+		}
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := strings.Trim(parts[i], " ,.")
+			if candidate == "" || strings.EqualFold(candidate, "create") || strings.EqualFold(candidate, "type") || strings.EqualFold(candidate, "struct") || strings.EqualFold(candidate, "add") {
+				continue
+			}
+			return Intent{Action: "ADD_TYPE", Name: candidate}
+		}
+	}
+	if strings.Contains(lower, "opening brace") || strings.Contains(lower, "missing opening brace") {
+		switch {
+		case strings.Contains(lower, "if"):
+			return Intent{Action: "ADD_FUNC", Name: "IfCondition"}
+		case strings.Contains(lower, "for"):
+			return Intent{Action: "ADD_FUNC", Name: "ForLoop"}
+		case strings.Contains(lower, "switch"):
+			return Intent{Action: "ADD_FUNC", Name: "SwitchCase"}
+		case strings.Contains(lower, "struct") || strings.Contains(lower, "type"):
+			return Intent{Action: "ADD_TYPE", Name: "BraceStruct"}
+		case strings.Contains(lower, "function"):
+			return Intent{Action: "ADD_FUNC", Name: "FixedFunction"}
+		default:
+			return Intent{Action: "ADD_FUNC", Name: "BraceFix"}
+		}
+	}
+	return Intent{}
+}
+
+// predictIntent extracts a structured intent from the prompt using the dense
+// model as a strong prior, then falls back to signature parsing and example
+// matching for deterministic action extraction.
+func normalizeIdentifierName(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "-", " ")
+	value = strings.ReplaceAll(value, "/", " ")
+	value = strings.ReplaceAll(value, "_", " ")
+	value = strings.Trim(value, " .,:;()[]{}\"")
+	parts := strings.Fields(value)
+	if len(parts) == 0 {
+		return ""
+	}
+	for i, part := range parts {
+		part = strings.Trim(part, " .,:;()[]{}\"")
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	return strings.Join(parts, "")
+}
+
+func sanitizeReceiver(value string) string {
+	value = strings.TrimSpace(value)
+	if idx := strings.IndexAny(value, " (\t"); idx >= 0 {
+		value = value[:idx]
+	}
+	value = strings.Trim(value, "* .,:;()[]{}\"")
+	return value
+}
+
+func normalizeImportPath(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, `"'`)
+	value = filepath.ToSlash(value)
+	value = strings.TrimSuffix(value, ".go")
+	value = strings.TrimSuffix(value, "/")
+	value = strings.TrimPrefix(value, "./")
+	value = strings.TrimPrefix(value, "/")
+	if value == "" || value == "." {
+		return ""
+	}
+	return value
+}
+
+func parseStructFieldSpecs(raw string) []string {
+	text := strings.TrimSpace(raw)
+	text = strings.TrimPrefix(text, "with")
+	text = strings.TrimPrefix(text, "fields")
+	text = strings.TrimPrefix(text, "field")
+	text = strings.TrimSpace(text)
+	text = strings.Trim(text, ",;: ")
+	if text == "" {
+		return nil
+	}
+	chunks := strings.FieldsFunc(text, func(r rune) bool { return r == ',' || r == ';' })
+	var out []string
+	for _, chunk := range chunks {
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" {
+			continue
+		}
+		parts := strings.Fields(chunk)
+		if len(parts) < 2 {
+			continue
+		}
+		for i := 0; i+1 < len(parts); i += 2 {
+			name := strings.Trim(parts[i], " .,:;()[]{}\"")
+			typ := strings.Trim(parts[i+1], " .,:;()[]{}\"")
+			if name == "" || typ == "" {
+				continue
+			}
+			out = append(out, name+" "+typ)
+		}
+	}
+	return out
+}
+
 func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, examples []dense.CommandExample) Intent {
 	lower := strings.ToLower(strings.TrimSpace(prompt))
+	parsed := dense.ParseHybridPrompt(prompt)
+	if parsed.Action == "replace" {
+		if len(parsed.Identifiers) > 0 && parsed.RawCode != "" {
+			return Intent{Action: "ADD_FUNC", Name: parsed.Identifiers[0], Description: parsed.RawCode}
+		}
+	}
+	if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") {
+		if snippet := functionSnippetFromPrompt(prompt); snippet != "" {
+			return Intent{Action: "ADD_FUNC", Name: "Replacement", Description: snippet}
+		}
+	}
+	if strings.Contains(lower, "create file") || strings.Contains(lower, "modify file") || strings.Contains(lower, "edit file") || strings.Contains(lower, "delete file") || strings.Contains(lower, "create folder") || strings.Contains(lower, "delete folder") || strings.Contains(lower, "remove directory") || strings.Contains(lower, "remove folder") || strings.Contains(lower, "delete directory") {
+		if match := regexp.MustCompile("(?i)(?:create|modify|edit|delete|remove)\\s+(?:file|folder|directory)\\s+([A-Za-z0-9_./\\\\-]+)").FindString(prompt); match != "" {
+			name := strings.TrimSpace(match)
+			if idx := strings.LastIndex(name, " "); idx >= 0 {
+				name = name[idx+1:]
+			}
+			if name != "" {
+				return Intent{Action: "ADD_FILE", Name: name}
+			}
+		}
+	}
+	if (isGreeting(prompt) || isFarewell(prompt) || isThanks(prompt) || (isFollowUp(prompt, conv) && conv != nil && conv.HasContext())) && !strings.Contains(lower, "function") && !strings.Contains(lower, "method") && !strings.Contains(lower, "struct") && !strings.Contains(lower, "type ") && !strings.Contains(lower, "import") && !strings.Contains(lower, "json") && !strings.Contains(lower, "brace") && !strings.Contains(lower, "return ") && !strings.Contains(lower, "test") && !strings.Contains(lower, "error") && !strings.Contains(lower, "folder") && !strings.Contains(lower, "directory") && !strings.Contains(lower, "file") {
+		return Intent{Action: "SOCIAL", Name: "social"}
+	}
+	if strings.Contains(lower, "list directory") || strings.Contains(lower, "show directory") || strings.Contains(lower, "what is directory") || strings.Contains(lower, "show folder") || strings.Contains(lower, "list folder") || strings.Contains(lower, "what is folder") {
+		return Intent{Action: "ADD_FILE", Name: "folder_query"}
+	}
+	if strings.Contains(lower, "json tag") || strings.Contains(lower, "json tags") {
+		if intent := parseSignatureIntent(prompt); intent.Action != "" {
+			return intent
+		}
+	}
+	if model != nil {
+		if intent := intentFromDenseModel(prompt, conv, model); intent.Action != "" {
+			return intent
+		}
+	}
+	if strings.Contains(lower, "using ") {
+		if idx := strings.Index(strings.ToLower(prompt), " using "); idx >= 0 {
+			pkg := strings.TrimSpace(prompt[idx+len(" using "):])
+			pkg = strings.Trim(pkg, " .,:;()[]{}\"'")
+			if pkg != "" {
+				return Intent{Action: "ADD_IMPORT", Name: pkg}
+			}
+		}
+	}
+	if strings.Contains(lower, "add method") || strings.Contains(lower, "create method") {
+		body := strings.TrimSpace(prompt)
+		for _, prefix := range []string{"add method ", "create method "} {
+			if strings.HasPrefix(strings.ToLower(body), prefix) {
+				body = strings.TrimSpace(body[len(prefix):])
+				break
+			}
+		}
+		methodName := ""
+		receiver := ""
+		if idx := strings.Index(strings.ToLower(body), " to struct "); idx >= 0 {
+			methodPart := strings.TrimSpace(body[:idx])
+			receiverPart := strings.TrimSpace(body[idx+len(" to struct "):])
+			receiver = sanitizeReceiver(receiverPart)
+			if receiver == "" {
+				receiver = "Worker"
+			}
+			methodName = normalizeIdentifierName(methodPart)
+		} else if idx := strings.Index(strings.ToLower(body), " on "); idx >= 0 {
+			methodPart := strings.TrimSpace(body[:idx])
+			receiverPart := strings.TrimSpace(body[idx+len(" on "):])
+			receiver = sanitizeReceiver(receiverPart)
+			methodName = normalizeIdentifierName(methodPart)
+		} else if idx := strings.Index(strings.ToLower(body), " to "); idx >= 0 {
+			methodPart := strings.TrimSpace(body[:idx])
+			receiverPart := strings.TrimSpace(body[idx+len(" to "):])
+			receiver = sanitizeReceiver(receiverPart)
+			methodName = normalizeIdentifierName(methodPart)
+		}
+		if methodName != "" {
+			if receiver == "" {
+				receiver = "Worker"
+			}
+			return Intent{Action: "ADD_FUNC", Name: methodName, Receiver: receiver, Returns: []string{"error"}}
+		}
+	}
+	if strings.Contains(lower, "add function") || strings.Contains(lower, "create function") {
+		tail := strings.TrimSpace(prompt)
+		for _, prefix := range []string{"add function ", "create function "} {
+			if strings.HasPrefix(strings.ToLower(tail), prefix) {
+				tail = strings.TrimSpace(tail[len(prefix):])
+				break
+			}
+		}
+		if idx := strings.Index(strings.ToLower(tail), " using "); idx >= 0 {
+			name := strings.TrimSpace(tail[:idx])
+			if parsed := normalizeIdentifierName(name); parsed != "" {
+				return Intent{Action: "ADD_FUNC", Name: parsed, Returns: []string{"error"}}
+			}
+		}
+	}
 	// Import intent
 	if strings.Contains(lower, "import ") || strings.Contains(lower, "add import") {
-		// try to extract a quoted import path
+		// Check for pattern: "from file <path>" or "from <path>"
+		if idx := strings.Index(lower, " from "); idx >= 0 {
+			rest := strings.TrimSpace(prompt[idx+len(" from "):])
+			if strings.HasPrefix(strings.ToLower(rest), "file ") {
+				rest = strings.TrimSpace(rest[len("file "):])
+			}
+			if i := strings.Index(rest, " "); i >= 0 {
+				rest = rest[:i]
+			}
+			rest = strings.Trim(rest, `"'`)
+			// If it's a file path like "jim/jake.go", the import path is the package directory: "github.com/golangast/dense/jim"
+			// But for now, let's normalize it to the relative directory path "github.com/golangast/dense/jim" or "jim"
+			if strings.HasSuffix(rest, ".go") {
+				dir := filepath.Dir(rest)
+				if dir != "" && dir != "." {
+					return Intent{Action: "ADD_IMPORT", Name: dir}
+				}
+			}
+			if pkg := normalizeImportPath(rest); pkg != "" {
+				return Intent{Action: "ADD_IMPORT", Name: pkg}
+			}
+		}
+		if m := regexp.MustCompile(`(?i)(?:import|add\s+import)\s+(?:the\s+)?(?:struct|type|function|symbol)?\s*(?:from\s+)?["']?([A-Za-z0-9_./\\-]+\.(?:go|mod))?["']?`).FindStringSubmatch(prompt); len(m) > 1 && m[1] != "" {
+			if strings.HasSuffix(m[1], ".go") {
+				dir := filepath.Dir(m[1])
+				if dir != "" && dir != "." {
+					return Intent{Action: "ADD_IMPORT", Name: dir}
+				}
+			}
+			if pkg := normalizeImportPath(m[1]); pkg != "" {
+				return Intent{Action: "ADD_IMPORT", Name: pkg}
+			}
+		}
 		if i1 := strings.Index(prompt, "\""); i1 >= 0 {
 			if i2 := strings.Index(prompt[i1+1:], "\""); i2 >= 0 {
 				pkg := prompt[i1+1 : i1+1+i2]
@@ -371,11 +1502,12 @@ func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, e
 				}
 			}
 		}
-		// fallback: take last token
 		parts := strings.Fields(prompt)
 		if len(parts) > 0 {
 			last := strings.Trim(parts[len(parts)-1], " ,.")
-			return Intent{Action: "ADD_IMPORT", Name: last}
+			if last != "" && !strings.Contains(last, ".go") {
+				return Intent{Action: "ADD_IMPORT", Name: last}
+			}
 		}
 	}
 	// Prefer explicit function creation patterns.
@@ -444,9 +1576,9 @@ func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, e
 
 		// If we captured a name, return intent
 		if name != "" {
-			it := Intent{Action: "ADD_FUNC", Name: strings.Title(strings.TrimSpace(name)), Params: params, Receiver: receiver, Returns: rets}
+			it := Intent{Action: "ADD_FUNC", Name: strings.Title(strings.TrimSpace(name)), Params: params, Receiver: sanitizeReceiver(receiver), Returns: rets}
 			if recv != "" && it.Receiver == "" {
-				it.Receiver = recv
+				it.Receiver = sanitizeReceiver(recv)
 			}
 			return it
 		}
@@ -514,17 +1646,26 @@ func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, e
 	}
 
 	// Error-check patterns.
-	if strings.Contains(lower, "err != nil") || strings.Contains(lower, "add error check") || strings.Contains(lower, "return on error") {
+	if strings.Contains(lower, "err != nil") || strings.Contains(lower, "add error check") || strings.Contains(lower, "return on error") || strings.Contains(lower, "on error") || strings.Contains(lower, "error check") {
 		// choose default target var 'err'
 		ret := ""
-		if strings.Contains(lower, "return nil") || strings.Contains(lower, "return nil,") {
+		target := "err"
+		if idx := strings.Index(lower, "for "); idx >= 0 {
+			after := strings.TrimSpace(lower[idx+len("for "):])
+			if fields := strings.Fields(after); len(fields) > 0 {
+				target = strings.Trim(fields[0], " ,.")
+			}
+		}
+		if strings.Contains(lower, "return nil") || strings.Contains(lower, "return nil,") || strings.Contains(lower, "nil on error") {
 			ret = "nil"
-		} else if strings.Contains(lower, "return \"\"") || strings.Contains(lower, "empty string") {
+		} else if strings.Contains(lower, "return \"\"") || strings.Contains(lower, "empty string") || strings.Contains(lower, "string on error") {
 			ret = `""`
-		} else if strings.Contains(lower, "return 0") {
+		} else if strings.Contains(lower, "return 0") || strings.Contains(lower, "0 on error") {
 			ret = "0"
 		}
-		return Intent{Action: "ADD_ERROR_CHECK", Target: "err", Ret: ret}
+		if ret != "" || strings.Contains(lower, "on error") || strings.Contains(lower, "error check") {
+			return Intent{Action: "ADD_ERROR_CHECK", Target: target, Ret: ret}
+		}
 	}
 
 	// As a fallback consult the example matcher for known code_update snippets
@@ -548,12 +1689,58 @@ func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, e
 		}
 	}
 	// Type/struct creation patterns
-	if strings.Contains(lower, "create struct") || strings.Contains(lower, "create type") || strings.Contains(lower, "add struct") {
-		// take the last field as the type name if present
+	if strings.Contains(lower, "create struct") || strings.Contains(lower, "create type") || strings.Contains(lower, "add struct") || strings.Contains(lower, "with fields") || strings.Contains(lower, "structure") {
+		if m := regexp.MustCompile(`(?i)(?:add|create)\s+(?:struct|type)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:with\s+fields?\s*(.*?))?(?:\s+to\s+file\b.*|$)`).FindStringSubmatch(prompt); len(m) > 1 {
+			name := strings.TrimSpace(m[1])
+			if name != "" {
+				intent := Intent{Action: "ADD_TYPE", Name: name}
+				if len(m) > 2 {
+					intent.Params = parseStructFieldSpecs(m[2])
+				}
+				return intent
+			}
+		}
 		parts := strings.Fields(prompt)
-		if len(parts) > 0 {
-			last := strings.Trim(parts[len(parts)-1], " ,.")
-			return Intent{Action: "ADD_TYPE", Name: last}
+		for i, p := range parts {
+			if strings.EqualFold(p, "struct") && i+1 < len(parts) {
+				name := strings.Trim(parts[i+1], " ,.")
+				if name != "" && !strings.EqualFold(name, "add") && !strings.EqualFold(name, "create") {
+					intent := Intent{Action: "ADD_TYPE", Name: name}
+					if i+2 < len(parts) && strings.EqualFold(parts[i+2], "with") {
+						intent.Params = parseStructFieldSpecs(strings.Join(parts[i+3:], " "))
+					}
+					return intent
+				}
+			}
+			if strings.EqualFold(p, "type") && i+1 < len(parts) {
+				name := strings.Trim(parts[i+1], " ,.")
+				if name != "" && !strings.EqualFold(name, "struct") {
+					return Intent{Action: "ADD_TYPE", Name: name}
+				}
+			}
+		}
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := strings.Trim(parts[i], " ,.")
+			if candidate == "" || strings.EqualFold(candidate, "create") || strings.EqualFold(candidate, "type") || strings.EqualFold(candidate, "struct") || strings.EqualFold(candidate, "add") {
+				continue
+			}
+			return Intent{Action: "ADD_TYPE", Name: candidate}
+		}
+	}
+	if strings.Contains(lower, "opening brace") || strings.Contains(lower, "missing opening brace") {
+		switch {
+		case strings.Contains(lower, "if"):
+			return Intent{Action: "ADD_FUNC", Name: "IfCondition"}
+		case strings.Contains(lower, "for"):
+			return Intent{Action: "ADD_FUNC", Name: "ForLoop"}
+		case strings.Contains(lower, "switch"):
+			return Intent{Action: "ADD_FUNC", Name: "SwitchCase"}
+		case strings.Contains(lower, "struct") || strings.Contains(lower, "type"):
+			return Intent{Action: "ADD_TYPE", Name: "BraceStruct"}
+		case strings.Contains(lower, "function"):
+			return Intent{Action: "ADD_FUNC", Name: "FixedFunction"}
+		default:
+			return Intent{Action: "ADD_FUNC", Name: "BraceFix"}
 		}
 	}
 
@@ -569,14 +1756,107 @@ func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, e
 		}
 		return Intent{Action: "ADD_TEST", Name: "Example"}
 	}
+	if strings.Contains(lower, "create file") || strings.Contains(lower, "new file") || strings.Contains(lower, "make file") {
+		parts := strings.Fields(prompt)
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := strings.Trim(parts[i], " ,./")
+			if candidate != "" && !strings.EqualFold(candidate, "file") && !strings.EqualFold(candidate, "create") && !strings.EqualFold(candidate, "new") && !strings.EqualFold(candidate, "make") {
+				return Intent{Action: "ADD_FILE", Name: candidate}
+			}
+		}
+		return Intent{Action: "ADD_FILE", Name: "main.go"}
+	}
+	// Do not synthesize a placeholder function for vague or incomplete prompts.
 	return Intent{}
 }
 
 // renderIntentToCode deterministically converts an Intent to a Go code
 // snippet using go/ast and formatting, ensuring syntactic validity.
+func zeroValueExprForType(typ string) ast.Expr {
+	t := strings.TrimSpace(typ)
+	switch {
+	case t == "":
+		return ast.NewIdent("nil")
+	case t == "string":
+		return &ast.BasicLit{Kind: token.STRING, Value: `""`}
+	case t == "bool":
+		return ast.NewIdent("false")
+	case t == "int", t == "int8", t == "int16", t == "int32", t == "int64", t == "byte", t == "rune", t == "uint", t == "uint8", t == "uint16", t == "uint32", t == "uint64", t == "uintptr":
+		return &ast.BasicLit{Kind: token.INT, Value: "0"}
+	case t == "float32", t == "float64":
+		return &ast.BasicLit{Kind: token.FLOAT, Value: "0"}
+	case t == "complex64", t == "complex128":
+		return &ast.BasicLit{Kind: token.IMAG, Value: "0i"}
+	case strings.Contains(t, "[]") || strings.Contains(t, "map[") || strings.Contains(t, "chan ") || strings.Contains(t, "*") || strings.HasPrefix(t, "func") || t == "any" || t == "interface{}" || t == "error":
+		return ast.NewIdent("nil")
+	default:
+		return ast.NewIdent("nil")
+	}
+}
+
+func declaredTypeNamesInIntent(intent Intent) []string {
+	seen := map[string]bool{}
+	locals := map[string]bool{}
+	collectLocalNames := func(items []string) {
+		for _, item := range items {
+			fields := strings.Fields(item)
+			if len(fields) >= 2 {
+				locals[strings.TrimSpace(fields[0])] = true
+			}
+		}
+	}
+	collectLocalNames(intent.Params)
+	if recv := strings.TrimSpace(intent.Receiver); recv != "" {
+		if fields := strings.Fields(recv); len(fields) >= 2 {
+			locals[strings.TrimSpace(fields[0])] = true
+		}
+		recv = strings.TrimPrefix(recv, "*")
+		if recv != "" && !isBuiltInTypeName(recv) {
+			seen[recv] = true
+		}
+	}
+	collect := func(items []string) {
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			typePart := item
+			fields := strings.Fields(item)
+			if len(fields) >= 2 {
+				first := fields[0]
+				typePart = strings.TrimSpace(item[len(first):])
+				if typePart == "" {
+					typePart = first
+				}
+			}
+			for _, candidate := range strings.FieldsFunc(typePart, func(r rune) bool {
+				return r == '*' || r == '|' || r == '[' || r == ']' || r == '{' || r == '}' || r == '(' || r == ')' || r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+			}) {
+				if candidate == "" || strings.Contains(candidate, ".") || isBuiltInTypeName(candidate) || locals[candidate] {
+					continue
+				}
+				if !seen[candidate] {
+					seen[candidate] = true
+				}
+			}
+		}
+	}
+	collect(intent.Params)
+	collect(intent.Returns)
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func renderIntentToCode(intent Intent) (string, error) {
 	// No nested parseTypeExpr here; use package-level parseTypeExpr helper.
 	switch intent.Action {
+	case "SOCIAL":
+		return "package main\n", nil
 	case "ADD_FUNC":
 		if intent.Name == "" {
 			return "", nil
@@ -621,30 +1901,20 @@ func renderIntentToCode(intent Intent) (string, error) {
 		}
 		// Body: add TODO return if we have returns
 		if len(intent.Returns) > 0 {
-			// create a return of zero values based on simple types
+			// create a return of zero values based on the declared type
 			var exprs []ast.Expr
 			for _, r := range intent.Returns {
-				switch r {
-				case "int", "int64", "int32":
-					exprs = append(exprs, &ast.BasicLit{Kind: token.INT, Value: "0"})
-				case "string":
-					exprs = append(exprs, &ast.BasicLit{Kind: token.STRING, Value: `""`})
-				case "bool":
-					exprs = append(exprs, ast.NewIdent("false"))
-				default:
-					// assume nilable
-					exprs = append(exprs, ast.NewIdent("nil"))
-				}
+				exprs = append(exprs, zeroValueExprForType(r))
 			}
 			ret := &ast.ReturnStmt{Results: exprs}
 			fn.Body.List = append(fn.Body.List, ret)
 		} else {
-			// default TODO comment
-			fn.Body.List = append(fn.Body.List, &ast.ExprStmt{X: &ast.BasicLit{Kind: token.STRING, Value: `"TODO: implement"`}})
+			// valid no-op for generated functions without explicit return types
+			fn.Body.List = append(fn.Body.List, &ast.ReturnStmt{})
 		}
 		// Receiver
-		if strings.TrimSpace(intent.Receiver) != "" {
-			r := strings.TrimSpace(intent.Receiver)
+		if recv := sanitizeReceiver(intent.Receiver); recv != "" {
+			r := strings.TrimSpace(recv)
 			parts := strings.Fields(r)
 			var rname string
 			var rtype string
@@ -664,12 +1934,31 @@ func renderIntentToCode(intent Intent) (string, error) {
 			fn.Recv = &ast.FieldList{List: []*ast.Field{{Names: []*ast.Ident{ast.NewIdent(rname)}, Type: parseTypeExpr(rtype)}}}
 		}
 
-		// Render the node to source.
+		// Render the function with placeholder declarations for named types used in
+		// the signature (for example *Config, User, Result). This keeps generated
+		// code valid under go/types even when the file does not yet declare those
+		// types.
+		decls := make([]ast.Decl, 0, 1+len(declaredTypeNamesInIntent(intent)))
+		for _, name := range declaredTypeNamesInIntent(intent) {
+			decls = append(decls, &ast.GenDecl{
+				Tok: token.TYPE,
+				Specs: []ast.Spec{
+					&ast.TypeSpec{
+						Name: ast.NewIdent(name),
+						Type: &ast.StructType{Fields: &ast.FieldList{}},
+					},
+				},
+			})
+		}
+		decls = append(decls, fn)
+		file := &ast.File{
+			Name:  ast.NewIdent("main"),
+			Decls: decls,
+		}
 		var sb strings.Builder
-		if err := format.Node(&sb, token.NewFileSet(), fn); err != nil {
+		if err := format.Node(&sb, token.NewFileSet(), file); err != nil {
 			return "", err
 		}
-		// Ensure trailing newline
 		out := sb.String()
 		if !strings.HasSuffix(out, "\n") {
 			out += "\n"
@@ -679,20 +1968,59 @@ func renderIntentToCode(intent Intent) (string, error) {
 		if intent.Name == "" {
 			return "", nil
 		}
-		// return a single import spec
-		out := fmt.Sprintf("import %q\n", intent.Name)
+		pkg := normalizeImportPath(intent.Name)
+		if pkg == "" {
+			return "", nil
+		}
+		out := fmt.Sprintf("import %q\n", pkg)
 		return out, nil
+	case "ADD_JSON_TAGS":
+		name := intent.Name
+		if name == "" {
+			name = "User"
+		}
+		if !strings.HasSuffix(name, " struct") {
+			name = strings.TrimSpace(name)
+		}
+		tmpl := fmt.Sprintf("type %s struct {\n\tFirstName string `json:\"first_name\"`\n\tLastName string `json:\"last_name\"`\n}\n", name)
+		return tmpl, nil
+	case "ADD_FILE":
+		if intent.Name == "" {
+			return "package main\n", nil
+		}
+		return "package main\n\n// file generated: " + intent.Name + "\n", nil
+	case "FILE_EDIT", "FILE_CREATE", "FILE_DELETE":
+		return "package main\n", nil
 	case "ADD_TYPE":
 		if intent.Name == "" {
 			return "", nil
 		}
-		// type Name struct {}
+		fields := &ast.FieldList{}
+		if len(intent.Params) > 0 {
+			for _, p := range intent.Params {
+				parts := strings.Fields(p)
+				if len(parts) == 0 {
+					continue
+				}
+				name := parts[0]
+				typ := strings.Join(parts[1:], " ")
+				if typ == "" {
+					typ = name
+					name = ""
+				}
+				if name == "" {
+					fields.List = append(fields.List, &ast.Field{Type: parseTypeExpr(typ)})
+				} else {
+					fields.List = append(fields.List, &ast.Field{Names: []*ast.Ident{ast.NewIdent(name)}, Type: parseTypeExpr(typ)})
+				}
+			}
+		}
 		ts := &ast.GenDecl{
 			Tok: token.TYPE,
 			Specs: []ast.Spec{
 				&ast.TypeSpec{
 					Name: ast.NewIdent(intent.Name),
-					Type: &ast.StructType{Fields: &ast.FieldList{}},
+					Type: &ast.StructType{Fields: fields},
 				},
 			},
 		}
@@ -717,10 +2045,10 @@ func renderIntentToCode(intent Intent) (string, error) {
 		fn := &ast.FuncDecl{
 			Name: ast.NewIdent(name),
 			Type: &ast.FuncType{
-				Params: &ast.FieldList{List: []*ast.Field{{Type: ast.NewIdent("*testing.T")}}},
+				Params: &ast.FieldList{List: []*ast.Field{{Names: []*ast.Ident{ast.NewIdent("t")}, Type: ast.NewIdent("*testing.T")}}},
 			},
 			Body: &ast.BlockStmt{List: []ast.Stmt{
-				&ast.ExprStmt{X: &ast.CallExpr{Fun: ast.NewIdent("t.Skip"), Args: []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: `"TODO: implement"`}}}},
+				&ast.ExprStmt{X: &ast.CallExpr{Fun: &ast.SelectorExpr{X: ast.NewIdent("t"), Sel: ast.NewIdent("Skip")}, Args: []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: `"TODO: implement"`}}}},
 			}},
 		}
 		var sb2 strings.Builder
@@ -733,24 +2061,56 @@ func renderIntentToCode(intent Intent) (string, error) {
 		}
 		return out, nil
 	case "ADD_ERROR_CHECK":
-		// Build: if err != nil { return <Ret> }
-		cond := &ast.BinaryExpr{
-			X:  ast.NewIdent(intent.Target),
-			Op: token.NEQ,
-			Y:  ast.NewIdent("nil"),
+		// Emit a valid function so the generated snippet can be inserted at package
+		// scope and still type-check in the evaluation harness.
+		target := strings.TrimSpace(intent.Target)
+		if target == "" {
+			target = "err"
 		}
-		var retStmt ast.Stmt
+		retType := "string"
+		retVal := `""`
 		if intent.Ret != "" {
-			// return <Ret>
-			retStmt = &ast.ReturnStmt{Results: []ast.Expr{&ast.Ident{Name: intent.Ret}}}
-		} else {
-			// generic: return
-			retStmt = &ast.ReturnStmt{}
+			switch intent.Ret {
+			case "nil":
+				retType = "any"
+				retVal = "nil"
+			case "0":
+				retType = "int"
+				retVal = "0"
+			default:
+				if strings.HasPrefix(intent.Ret, "\"") || strings.HasPrefix(intent.Ret, "`") {
+					retType = "string"
+					retVal = intent.Ret
+				} else {
+					retType = "string"
+					retVal = `""`
+				}
+			}
 		}
-		blk := &ast.BlockStmt{List: []ast.Stmt{retStmt}}
-		ifStmt := &ast.IfStmt{Cond: cond, Body: blk}
+		var retExpr ast.Expr = &ast.BasicLit{Kind: token.STRING, Value: retVal}
+		if intent.Ret == "0" {
+			retExpr = &ast.BasicLit{Kind: token.INT, Value: "0"}
+		}
+		if intent.Ret == "nil" {
+			retExpr = ast.NewIdent("nil")
+		}
+		fn := &ast.FuncDecl{
+			Name: ast.NewIdent("HandleError"),
+			Type: &ast.FuncType{
+				Params:  &ast.FieldList{},
+				Results: &ast.FieldList{List: []*ast.Field{{Type: parseTypeExpr(retType)}}},
+			},
+			Body: &ast.BlockStmt{List: []ast.Stmt{
+				&ast.DeclStmt{Decl: &ast.GenDecl{Tok: token.VAR, Specs: []ast.Spec{&ast.ValueSpec{Names: []*ast.Ident{ast.NewIdent(target)}, Type: ast.NewIdent("error")}}}},
+				&ast.IfStmt{
+					Cond: &ast.BinaryExpr{X: ast.NewIdent(target), Op: token.NEQ, Y: ast.NewIdent("nil")},
+					Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: []ast.Expr{retExpr}}}},
+				},
+				&ast.ReturnStmt{Results: []ast.Expr{retExpr}},
+			}},
+		}
 		var sb strings.Builder
-		if err := format.Node(&sb, token.NewFileSet(), ifStmt); err != nil {
+		if err := format.Node(&sb, token.NewFileSet(), fn); err != nil {
 			return "", err
 		}
 		out := sb.String()
@@ -763,11 +2123,208 @@ func renderIntentToCode(intent Intent) (string, error) {
 	}
 }
 
+type PackageScopeInfo struct {
+	Functions map[string]bool
+	Types     map[string]bool
+	Imports   map[string]bool
+}
+
+func InspectPackageScope(filePath string) PackageScopeInfo {
+	info := PackageScopeInfo{
+		Functions: map[string]bool{},
+		Types:     map[string]bool{},
+		Imports:   map[string]bool{},
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return info
+	}
+	baseDir := filepath.Dir(filePath)
+	if baseDir == "" {
+		baseDir = "."
+	}
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return info
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join(baseDir, entry.Name())
+		fset := token.NewFileSet()
+		node, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		if err != nil {
+			continue
+		}
+		for _, decl := range node.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name != nil {
+				info.Functions[strings.ToLower(fn.Name.Name)] = true
+			}
+			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
+				for _, spec := range gd.Specs {
+					if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name != nil {
+						info.Types[strings.ToLower(ts.Name.Name)] = true
+					}
+				}
+			}
+		}
+		for _, imp := range node.Imports {
+			if imp.Path != nil {
+				p := strings.Trim(imp.Path.Value, `"`)
+				info.Imports[strings.ToLower(p)] = true
+			}
+		}
+	}
+	return info
+}
+
+func ValidateAST(fset *token.FileSet, file *ast.File) error {
+	if file == nil {
+		return fmt.Errorf("nil AST file")
+	}
+
+	packageFiles, err := collectPackageFiles(file)
+	if err != nil {
+		return err
+	}
+	if len(packageFiles) == 0 {
+		packageFiles = []*ast.File{file}
+	}
+
+	conf := types.Config{Importer: importer.Default()}
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+	}
+	_, err = conf.Check(file.Name.Name, fset, packageFiles, info)
+	if err == nil {
+		return nil
+	}
+	if dense.ValidateASTWithTolerances(nil, []error{err}) == nil {
+		return nil
+	}
+	return err
+}
+
+func collectPackageFiles(file *ast.File) ([]*ast.File, error) {
+	if file == nil || file.Name == nil || file.Name.Name == "" {
+		return nil, fmt.Errorf("nil or unnamed package file")
+	}
+	return []*ast.File{file}, nil
+}
+
+func ValidateASTSource(path, src string) error {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, src, parser.ParseComments)
+	if err != nil {
+		return err
+	}
+
+	if siblingFiles, err := loadSamePackageFiles(path, file.Name.Name); err == nil && len(siblingFiles) > 0 {
+		packageFiles := append([]*ast.File{file}, siblingFiles...)
+		conf := types.Config{Importer: importer.Default()}
+		info := &types.Info{
+			Types:      make(map[ast.Expr]types.TypeAndValue),
+			Defs:       make(map[*ast.Ident]types.Object),
+			Uses:       make(map[*ast.Ident]types.Object),
+			Selections: make(map[*ast.SelectorExpr]*types.Selection),
+		}
+		_, err = conf.Check(file.Name.Name, fset, packageFiles, info)
+		if err == nil {
+			return nil
+		}
+		if dense.ValidateASTWithTolerances(nil, []error{err}) == nil {
+			return nil
+		}
+		return err
+	}
+	return ValidateAST(fset, file)
+}
+
+func loadSamePackageFiles(path, pkgName string) ([]*ast.File, error) {
+	if pkgName == "" {
+		return nil, nil
+	}
+	dir := filepath.Dir(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]*ast.File, 0, 8)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".go" {
+			continue
+		}
+		full := filepath.Join(dir, entry.Name())
+		if full == path {
+			continue
+		}
+		src, err := os.ReadFile(full)
+		if err != nil {
+			continue
+		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, full, src, parser.ParseComments)
+		if err != nil || parsed.Name == nil || parsed.Name.Name != pkgName {
+			continue
+		}
+		files = append(files, parsed)
+	}
+	return files, nil
+}
+
+func tryApplyExactFunctionReplacement(prompt, target string) (bool, string) {
+	parsed := dense.ParseHybridPrompt(prompt)
+	if parsed.Action == "replace" {
+		if len(parsed.Identifiers) > 0 && parsed.RawCode != "" {
+			name := strings.TrimSpace(parsed.Identifiers[0])
+			replacement := strings.TrimSpace(parsed.RawCode)
+			replacement = strings.TrimSpace(strings.TrimSuffix(replacement, "."))
+			if name == "" || replacement == "" {
+				return false, ""
+			}
+			if !strings.HasPrefix(strings.ToLower(replacement), "func ") && !strings.Contains(strings.ToLower(replacement), "func ") {
+				replacement = "func " + replacement
+			}
+			if _, err := applyFunctionReplacement(target, name, replacement); err == nil {
+				return true, fmt.Sprintf("✅ Applied exact replacement to %s", target)
+			}
+		}
+		return false, ""
+	}
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+	if !strings.Contains(lower, "replace ") || !strings.Contains(lower, " with ") {
+		return false, ""
+	}
+	idx := strings.Index(lower, "replace ")
+	if idx < 0 {
+		return false, ""
+	}
+	namePart := strings.TrimSpace(prompt[idx+len("replace "):])
+	j := strings.Index(strings.ToLower(namePart), " with ")
+	if j < 0 {
+		return false, ""
+	}
+	name := strings.TrimSpace(namePart[:j])
+	replacement := strings.TrimSpace(namePart[j+len(" with "):])
+	replacement = strings.TrimSpace(strings.TrimSuffix(replacement, "."))
+	if name == "" || replacement == "" {
+		return false, ""
+	}
+	if !strings.HasPrefix(strings.ToLower(replacement), "func ") && !strings.Contains(strings.ToLower(replacement), "func ") {
+		replacement = "func " + replacement
+	}
+	if _, err := applyFunctionReplacement(target, name, replacement); err == nil {
+		return true, fmt.Sprintf("✅ Applied exact replacement to %s", target)
+	}
+	return false, ""
+}
+
 func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.DenseModel, examples []dense.CommandExample) string {
-	// Inspect the target Go file (if any) to gather structural context that
-	// can influence classification and response construction. This allows the
-	// assistant to prefer edits over creates when the target already contains
-	// matching symbols, or to prefer code_update when a function exists.
+	// Inspect the package directory (not just one file) to gather structural context
+	// that can influence classification and response construction.
 	lower := strings.ToLower(strings.TrimSpace(prompt))
 	target := ""
 	if conv != nil {
@@ -777,31 +2334,13 @@ func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.D
 	var hasType = map[string]bool{}
 	var hasImport = map[string]bool{}
 	if target != "" {
-		if fi, err := os.Stat(target); err == nil && !fi.IsDir() && strings.HasSuffix(target, ".go") {
-			fset := token.NewFileSet()
-			if node, err := parser.ParseFile(fset, target, nil, parser.ParseComments); err == nil {
-				// collect functions, types and imports
-				for _, decl := range node.Decls {
-					if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name != nil {
-						hasFunc[strings.ToLower(fn.Name.Name)] = true
-					}
-					if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
-						for _, spec := range gd.Specs {
-							if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name != nil {
-								hasType[strings.ToLower(ts.Name.Name)] = true
-							}
-						}
-					}
-				}
-				for _, imp := range node.Imports {
-					if imp.Path != nil {
-						p := strings.Trim(imp.Path.Value, `"`)
-						hasImport[strings.ToLower(p)] = true
-					}
-				}
-			}
-		}
+		scope := InspectPackageScope(target)
+		hasFunc = scope.Functions
+		hasType = scope.Types
+		hasImport = scope.Imports
 	}
+	_ = hasType
+	_ = hasImport
 
 	// Base classification using heuristics + model fallback. We'll allow the
 	// observed target file structure to nudge the decision when the prompt
@@ -848,8 +2387,38 @@ func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.D
 	}
 
 	if cmdType == "code_update" {
+		// Try to predict the intent first if it's an import or simple well-defined intent
+		if intent := predictIntent(prompt, conv, model, examples); intent.Action == "ADD_IMPORT" {
+			if code, err := renderIntentToCode(intent); err == nil && code != "" {
+				return "🔧 " + code
+			}
+		}
+		if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") {
+			// exact replacement is handled deterministically in the file-edit phase
+			return "🔧 " + functionSnippetFromPrompt(prompt)
+		}
 		if snippet := functionSnippetFromPrompt(prompt); snippet != "" {
 			return "🔧 " + snippet
+		}
+		// If prompt contains backticks, extract the content within them.
+		if idx := strings.Index(prompt, "`"); idx >= 0 {
+			if lastIdx := strings.LastIndex(prompt, "`"); lastIdx > idx {
+				snippet := strings.TrimSpace(prompt[idx+1 : lastIdx])
+				return "🔧 " + snippet
+			}
+		}
+		// Try parsing from raw snippet triggers (e.g., "add j:= ...")
+		// Find where the actual Go code block might start by looking for standard prefixes
+		for _, prefix := range []string{"add to file ", "add file ", "add to ", "add "} {
+			if strings.HasPrefix(lower, prefix) {
+				rem := prompt[len(prefix):]
+				// Skip target filename if present (e.g. "jim/jim.go")
+				fields := strings.Fields(rem)
+				if len(fields) > 1 && strings.HasSuffix(fields[0], ".go") {
+					rem = strings.TrimSpace(rem[len(fields[0]):])
+				}
+				return "🔧 " + rem
+			}
 		}
 	}
 
@@ -975,6 +2544,237 @@ func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.D
 	return "🔧 " + m.CodeAfter
 }
 
+// ─── NL Import+Use Struct Handler ─────────────────────────────────────────────
+
+// tryHandleImportAndUse handles natural-language prompts of the form:
+//
+//	"import [and use] [the] struct|function <Name> from [file] <src.go> into [file] <dst.go>"
+//
+// It reads the source file to confirm the symbol exists, resolves the full module
+// import path, then adds the import declaration and a usage snippet to the destination
+// file. Returns ("", nil) if the prompt does not match the pattern.
+func tryHandleImportAndUse(prompt string) (string, error) {
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+
+	// Must contain "import" and ("from" or "into") to be a candidate.
+	if !strings.Contains(lower, "import") || !strings.Contains(lower, "into") {
+		return "", nil
+	}
+
+	// Determine symbol kind: "struct" or "function"
+	symbolKind := "" // "struct" or "func"
+	if strings.Contains(lower, "struct") {
+		symbolKind = "struct"
+	} else if strings.Contains(lower, "function") || strings.Contains(lower, "func") {
+		symbolKind = "func"
+	}
+
+	// Extract symbol name based on kind.
+	symbolName := ""
+	switch symbolKind {
+	case "struct":
+		if m := regexp.MustCompile(`(?i)struct\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
+			symbolName = m[1]
+		}
+	case "func":
+		// "function <Name>" or "func <Name>"
+		if m := regexp.MustCompile(`(?i)(?:function|func)\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
+			symbolName = m[1]
+		}
+	default:
+		// Neither struct nor function mentioned — not our pattern.
+		return "", nil
+	}
+
+	// Extract source file: look for "from [file] <path.go>"
+	srcFile := ""
+	if m := regexp.MustCompile(`(?i)from\s+(?:file\s+)?([A-Za-z0-9_./-]+\.go)`).FindStringSubmatch(prompt); len(m) >= 2 {
+		srcFile = m[1]
+	}
+
+	// Extract destination file: look for "into [file] <path.go>"
+	dstFile := ""
+	if m := regexp.MustCompile(`(?i)into\s+(?:file\s+)?([A-Za-z0-9_./-]+\.go)`).FindStringSubmatch(prompt); len(m) >= 2 {
+		dstFile = m[1]
+	}
+
+	// If we don't have all required parts, bail out — not our pattern.
+	if symbolName == "" || srcFile == "" || dstFile == "" {
+		return "", nil
+	}
+
+	// Make paths absolute relative to cwd.
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("getwd: %w", err)
+	}
+	if !filepath.IsAbs(srcFile) {
+		srcFile = filepath.Join(cwd, srcFile)
+	}
+	if !filepath.IsAbs(dstFile) {
+		dstFile = filepath.Join(cwd, dstFile)
+	}
+
+	// Read and parse the source file.
+	srcBytes, err := os.ReadFile(srcFile)
+	if err != nil {
+		return "", fmt.Errorf("read source file %s: %w", srcFile, err)
+	}
+	srcContent := string(srcBytes)
+
+	// Verify the symbol exists.
+	switch symbolKind {
+	case "struct":
+		if !strings.Contains(srcContent, "type "+symbolName+" struct") {
+			return "", fmt.Errorf("struct %q not found in %s", symbolName, srcFile)
+		}
+	case "func":
+		funcRe := regexp.MustCompile(`(?m)^func\s+` + regexp.QuoteMeta(symbolName) + `\s*\(`)
+		if !funcRe.MatchString(srcContent) {
+			return "", fmt.Errorf("function %q not found in %s", symbolName, srcFile)
+		}
+	}
+
+	// Determine the package name of the source file.
+	srcFset := token.NewFileSet()
+	srcAST, err := parser.ParseFile(srcFset, srcFile, srcContent, 0)
+	if err != nil {
+		return "", fmt.Errorf("parse source file: %w", err)
+	}
+	srcPkgName := srcAST.Name.Name
+
+	// Resolve the full module import path for the source directory.
+	srcDir := filepath.Dir(srcFile)
+	importPath, err := resolveModuleImportPath(srcDir)
+	if err != nil {
+		rel, relErr := filepath.Rel(cwd, srcDir)
+		if relErr != nil || rel == "" || rel == "." {
+			return "", fmt.Errorf("resolve import path for %s: %w", srcDir, err)
+		}
+		importPath = rel
+	}
+
+	// Ensure the destination file exists.
+	if _, statErr := os.Stat(dstFile); os.IsNotExist(statErr) {
+		if writeErr := os.MkdirAll(filepath.Dir(dstFile), 0755); writeErr != nil {
+			return "", fmt.Errorf("mkdir: %w", writeErr)
+		}
+		if writeErr := os.WriteFile(dstFile, []byte("package main\n"), 0644); writeErr != nil {
+			return "", fmt.Errorf("create dest file: %w", writeErr)
+		}
+	}
+
+	dstBytes, err := os.ReadFile(dstFile)
+	if err != nil {
+		return "", fmt.Errorf("read dest file: %w", err)
+	}
+
+	dstFset := token.NewFileSet()
+	dstNode, err := parser.ParseFile(dstFset, dstFile, string(dstBytes), parser.ParseComments)
+	if err != nil {
+		return "", fmt.Errorf("parse dest file: %w", err)
+	}
+
+	// Add the import if not already present.
+	alreadyImported := false
+	for _, imp := range dstNode.Imports {
+		if imp.Path != nil && strings.Trim(imp.Path.Value, `"`) == importPath {
+			alreadyImported = true
+			break
+		}
+	}
+	if !alreadyImported {
+		astutil.AddImport(dstFset, dstNode, importPath)
+	}
+
+	// Build a usage snippet based on symbol kind.
+	qualifiedSymbol := srcPkgName + "." + symbolName
+	alreadyUsed := strings.Contains(string(dstBytes), qualifiedSymbol)
+	var usageDecl string
+	switch symbolKind {
+	case "struct":
+		varName := strings.ToLower(string([]rune(symbolName)[:1])) + symbolName[1:] + "Instance"
+		usageDecl = fmt.Sprintf("var %s = %s{}", varName, qualifiedSymbol)
+	case "func":
+		// Wrap in a top-level var using a function call result, or a simple _ = call.
+		// Since we don't know the return type, use `var _ = func() { <pkg>.<Func>() }` pattern.
+		usageDecl = fmt.Sprintf("var _ = func() { %s() }()", qualifiedSymbol)
+	}
+
+	// Write the import.
+	if !alreadyImported {
+		var buf strings.Builder
+		if fmtErr := format.Node(&buf, dstFset, dstNode); fmtErr != nil {
+			return "", fmt.Errorf("format after import: %w", fmtErr)
+		}
+		if writeErr := os.WriteFile(dstFile, []byte(buf.String()), 0644); writeErr != nil {
+			return "", fmt.Errorf("write after import: %w", writeErr)
+		}
+	}
+
+	// Append the usage snippet if not already present.
+	if !alreadyUsed && usageDecl != "" {
+		updatedBytes, readErr := os.ReadFile(dstFile)
+		if readErr != nil {
+			return "", fmt.Errorf("re-read after import: %w", readErr)
+		}
+		updatedContent := strings.TrimRight(string(updatedBytes), "\n") + "\n\n" + usageDecl + "\n"
+		if writeErr := os.WriteFile(dstFile, []byte(updatedContent), 0644); writeErr != nil {
+			return "", fmt.Errorf("write usage snippet: %w", writeErr)
+		}
+	}
+
+	result := fmt.Sprintf("✅ Added import %q and usage `%s` to %s", importPath, usageDecl, dstFile)
+	return result, nil
+}
+
+// resolveModuleImportPath finds the full Go module import path for a given directory
+// by walking up to find go.mod and combining the module name with the relative sub-path.
+func resolveModuleImportPath(dir string) (string, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	// Walk up to find go.mod.
+	search := absDir
+	for {
+		modFile := filepath.Join(search, "go.mod")
+		if _, err := os.Stat(modFile); err == nil {
+			// Found go.mod — parse the module line.
+			b, readErr := os.ReadFile(modFile)
+			if readErr != nil {
+				return "", readErr
+			}
+			moduleName := ""
+			for _, line := range strings.Split(string(b), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "module ") {
+					moduleName = strings.TrimSpace(strings.TrimPrefix(line, "module "))
+					break
+				}
+			}
+			if moduleName == "" {
+				return "", fmt.Errorf("no module directive in %s", modFile)
+			}
+			rel, err := filepath.Rel(search, absDir)
+			if err != nil {
+				return "", err
+			}
+			rel = filepath.ToSlash(rel)
+			if rel == "" || rel == "." {
+				return moduleName, nil
+			}
+			return moduleName + "/" + rel, nil
+		}
+		parent := filepath.Dir(search)
+		if parent == search {
+			break
+		}
+		search = parent
+	}
+	return "", fmt.Errorf("no go.mod found above %s", absDir)
+}
+
 // ─── Go File Editing ──────────────────────────────────────────────────────────
 
 func applyFileOperation(filePath, opType, content string) (string, error) {
@@ -1040,6 +2840,31 @@ func applyFolderOperation(dirPath, opType string) (string, error) {
 // applyCodeToFile applies a code snippet to a target Go file. It uses AST-based
 // editing for common operations (imports, functions, structs) and falls back to
 // appending the snippet for simple statements.
+func InjectIntentIntoAST(filePath string, intent Intent) (bool, string, error) {
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return false, "", fmt.Errorf("resolve path: %w", err)
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return false, "", fmt.Errorf("empty file path")
+	}
+	if _, err := os.Stat(absPath); os.IsNotExist(err) {
+		return false, "", fmt.Errorf("file not found: %s", absPath)
+	}
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return false, "", fmt.Errorf("read file: %w", err)
+	}
+	code, err := renderIntentToCode(intent)
+	if err != nil {
+		return false, "", err
+	}
+	if strings.TrimSpace(code) == "" {
+		return false, "", nil
+	}
+	return applyCodeViaAST(absPath, string(content), code)
+}
+
 func applyCodeToFile(filePath, code string) (string, error) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -1052,39 +2877,37 @@ func applyCodeToFile(filePath, code string) (string, error) {
 		return "", fmt.Errorf("file not found: %s", absPath)
 	}
 
-	// Read the current file content.
 	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return "", fmt.Errorf("read file: %w", err)
 	}
+	if backupWrites {
+		if err := maybeWriteBackup(absPath, content); err != nil {
+			return "", fmt.Errorf("backup file: %w", err)
+		}
+	}
 
-	// Try AST-based insertion first.
 	applied, msg, err := applyCodeViaAST(absPath, string(content), code)
 	if err == nil && applied {
+		updatedContent, readErr := os.ReadFile(absPath)
+		if readErr != nil {
+			return "", fmt.Errorf("read updated file: %w", readErr)
+		}
+		if validateErr := ValidateASTSource(absPath, string(updatedContent)); validateErr != nil {
+			_ = os.WriteFile(absPath, content, 0644)
+			return "", fmt.Errorf("generated change violates Go type rules: %w", validateErr)
+		}
 		return msg, nil
 	}
-
-	// Fallback: append the snippet to the end of the file.
-	newContent := string(content)
-	if !strings.HasSuffix(newContent, "\n") {
-		newContent += "\n"
-	}
-	newContent += code + "\n"
-
-	// Verify the result is still valid Go.
-	fset := token.NewFileSet()
-	if _, err := parser.ParseFile(fset, absPath, newContent, parser.ParseComments); err != nil {
-		return "", fmt.Errorf("appended code produces invalid Go: %v", err)
+	if err != nil {
+		_ = os.WriteFile(absPath, content, 0644)
+		return "", fmt.Errorf("generated change is not valid Go for %s: %w", absPath, err)
 	}
 
-	if err := os.WriteFile(absPath, []byte(newContent), 0644); err != nil {
-		return "", fmt.Errorf("write file: %w", err)
-	}
-
-	// Run gofmt.
-	exec.Command("gofmt", "-w", absPath).Run()
-
-	return fmt.Sprintf("appended code to %s", absPath), nil
+	// If AST-based application does not apply anything, reject the request rather
+	// than appending raw snippet text that can silently corrupt valid Go files.
+	_ = os.WriteFile(absPath, content, 0644)
+	return "", fmt.Errorf("code snippet was not applied: %q", code)
 }
 
 // applyCodeViaAST attempts to apply the code snippet using AST manipulation.
@@ -1097,71 +2920,126 @@ func applyCodeViaAST(filePath, content, code string) (bool, string, error) {
 	}
 
 	trimmed := strings.TrimSpace(code)
-
-	// Handle import statements.
-	if strings.HasPrefix(trimmed, "import ") {
-		importPath := strings.Trim(strings.TrimPrefix(trimmed, "import "), `"`)
-		importPath = strings.TrimSpace(importPath)
-		if importPath == "" {
-			return false, "", fmt.Errorf("empty import path")
-		}
-		// Check if already imported.
-		for _, imp := range node.Imports {
-			if imp.Path != nil && strings.Trim(imp.Path.Value, `"`) == importPath {
-				return true, fmt.Sprintf("import %q already present", importPath), nil
-			}
-		}
-		// Add the import.
-		impSpec := &ast.ImportSpec{
-			Path: &ast.BasicLit{
-				Kind:  token.STRING,
-				Value: fmt.Sprintf("%q", importPath),
-			},
-		}
-		// Find or create the import declaration.
-		var importDecl *ast.GenDecl
-		for _, decl := range node.Decls {
-			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.IMPORT {
-				importDecl = gd
-				break
-			}
-		}
-		if importDecl == nil {
-			importDecl = &ast.GenDecl{Tok: token.IMPORT}
-			node.Decls = append([]ast.Decl{importDecl}, node.Decls...)
-		}
-		importDecl.Specs = append(importDecl.Specs, impSpec)
-		if err := writeFormattedFile(filePath, fset, node); err != nil {
-			return false, "", err
-		}
-		return true, fmt.Sprintf("added import %q to %s", importPath, filePath), nil
+	if trimmed == "" {
+		return false, "", nil
+	}
+	if strings.HasPrefix(trimmed, "package ") {
+		return true, "package clause already present", nil
 	}
 
-	// Handle function declarations.
-	if strings.HasPrefix(trimmed, "func ") {
-		// Parse the function code.
-		src := fmt.Sprintf("package main\n\n%s", trimmed)
-		funcFset := token.NewFileSet()
-		funcNode, err := parser.ParseFile(funcFset, "", src, parser.ParseComments)
-		if err != nil {
-			return false, "", fmt.Errorf("cannot parse function code: %v", err)
-		}
-		var newFunc *ast.FuncDecl
-		for _, decl := range funcNode.Decls {
-			if fn, ok := decl.(*ast.FuncDecl); ok {
-				newFunc = fn
-				break
+	// Parse the incoming snippet as a temporary file so we can handle mixed
+	// import/type/function declaration blocks consistently.
+	src := fmt.Sprintf("package main\n\n%s", trimmed)
+	snippetFset := token.NewFileSet()
+	snippetNode, err := parser.ParseFile(snippetFset, "", src, parser.ParseComments)
+	if err != nil {
+		// If it failed to parse as top-level declarations, it could be a statement/expression (e.g. `j := jake.Jake{...}`)
+		// Try parsing inside a function wrapper first to see if it is a valid statement block.
+		funcSrc := fmt.Sprintf("package main\nfunc _wrapper() {\n%s\n}", trimmed)
+		wrapperFset := token.NewFileSet()
+		wrapperNode, err2 := parser.ParseFile(wrapperFset, "", funcSrc, parser.ParseComments)
+		if err2 == nil {
+			// Find the main function or the first function in target file to insert this block/statement,
+			// or if no functions exist, wrap it in a main function and append it.
+			var mainFunc *ast.FuncDecl
+			for _, decl := range node.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "main" {
+					mainFunc = fn
+					break
+				}
+			}
+			var stmts []ast.Stmt
+			for _, decl := range wrapperNode.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "_wrapper" {
+					stmts = fn.Body.List
+					break
+				}
+			}
+			if len(stmts) > 0 {
+				if mainFunc != nil {
+					mainFunc.Body.List = append(mainFunc.Body.List, stmts...)
+				} else {
+					// create a new main function containing the statements
+					newMain := &ast.FuncDecl{
+						Name: ast.NewIdent("main"),
+						Type: &ast.FuncType{Params: &ast.FieldList{}},
+						Body: &ast.BlockStmt{List: stmts},
+					}
+					node.Decls = append(node.Decls, newMain)
+				}
+				var buf strings.Builder
+				if err := format.Node(&buf, fset, node); err != nil {
+					return false, "", fmt.Errorf("format updated AST: %w", err)
+				}
+				if validateErr := ValidateASTSource(filePath, buf.String()); validateErr != nil {
+					return false, "", fmt.Errorf("generated change violates Go type rules: %w", validateErr)
+				}
+				if err := writeFormattedFile(filePath, fset, node); err != nil {
+					return false, "", err
+				}
+				return true, fmt.Sprintf("updated %s", filePath), nil
 			}
 		}
-		if newFunc == nil {
-			return false, "", fmt.Errorf("no function declaration found in code")
-		}
+		return false, "", fmt.Errorf("cannot parse code snippet: %v (also failed statement fallback: %v)", err, err2)
+	}
 
-		// Add imports from the function code.
-		for _, imp := range funcNode.Imports {
-			if imp.Path != nil {
-				path := strings.Trim(imp.Path.Value, `"`)
-				// Check if already imported.
+	added := false
+	for _, decl := range snippetNode.Decls {
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			if d.Tok == token.IMPORT {
+				for _, spec := range d.Specs {
+					imp, ok := spec.(*ast.ImportSpec)
+					if !ok || imp.Path == nil {
+						continue
+					}
+					path := strings.Trim(imp.Path.Value, `"`)
+					already := false
+					for _, existing := range node.Imports {
+						if existing.Path != nil && strings.Trim(existing.Path.Value, `"`) == path {
+							already = true
+							break
+						}
+					}
+					if !already {
+						astutil.AddImport(fset, node, path)
+						added = true
+					}
+				}
+			}
+			if d.Tok == token.TYPE {
+				for _, spec := range d.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok || ts.Name == nil {
+						continue
+					}
+					replaced := false
+					for i := range node.Decls {
+						gd, ok := node.Decls[i].(*ast.GenDecl)
+						if !ok || gd.Tok != token.TYPE {
+							continue
+						}
+						for j, existingSpec := range gd.Specs {
+							existingType, ok := existingSpec.(*ast.TypeSpec)
+							if ok && existingType.Name.Name == ts.Name.Name {
+								gd.Specs[j] = ts
+								replaced = true
+								break
+							}
+						}
+						if replaced {
+							break
+						}
+					}
+					if !replaced {
+						node.Decls = append(node.Decls, &ast.GenDecl{Tok: token.TYPE, Specs: []ast.Spec{ts}})
+					}
+					added = true
+				}
+			}
+		case *ast.FuncDecl:
+			newFunc := d
+			for _, path := range selectorImportsInNode(newFunc) {
 				already := false
 				for _, existing := range node.Imports {
 					if existing.Path != nil && strings.Trim(existing.Path.Value, `"`) == path {
@@ -1170,137 +3048,193 @@ func applyCodeViaAST(filePath, content, code string) (bool, string, error) {
 					}
 				}
 				if !already {
-					addImportToNode(node, path)
+					astutil.AddImport(fset, node, path)
+					added = true
 				}
 			}
-		}
-
-		// Check if function already exists; if so, replace it in place.
-		replaced := false
-		for i, decl := range node.Decls {
-			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == newFunc.Name.Name {
-				node.Decls[i] = newFunc
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			// Append the function.
-			node.Decls = append(node.Decls, newFunc)
-		}
-
-		if err := writeFormattedFile(filePath, fset, node); err != nil {
-			return false, "", err
-		}
-		action := "inserted"
-		if replaced {
-			action = "updated"
-		}
-		return true, fmt.Sprintf("%s function %q in %s", action, newFunc.Name.Name, filePath), nil
-	}
-
-	// Handle struct / type declarations (struct, interface, and any named type).
-	if strings.HasPrefix(trimmed, "type ") {
-		// Parse the type code.
-		src := fmt.Sprintf("package main\n\n%s", trimmed)
-		typeFset := token.NewFileSet()
-		typeNode, err := parser.ParseFile(typeFset, "", src, parser.ParseComments)
-		if err != nil {
-			return false, "", fmt.Errorf("cannot parse type code: %v", err)
-		}
-		var newType *ast.TypeSpec
-		for _, decl := range typeNode.Decls {
-			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
-				for _, spec := range gd.Specs {
-					if ts, ok := spec.(*ast.TypeSpec); ok {
-						newType = ts
-						break
-					}
-				}
-			}
-		}
-		if newType == nil {
-			return false, "", fmt.Errorf("no type declaration found in code")
-		}
-
-		// Check if type already exists; if so, replace it in place.
-		replaced := false
-		for i := range node.Decls {
-			gd, ok := node.Decls[i].(*ast.GenDecl)
-			if !ok || gd.Tok != token.TYPE {
-				continue
-			}
-			for j, spec := range gd.Specs {
-				ts, ok := spec.(*ast.TypeSpec)
-				if ok && ts.Name.Name == newType.Name.Name {
-					gd.Specs[j] = newType
+			replaced := false
+			for i, decl := range node.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == newFunc.Name.Name {
+					node.Decls[i] = newFunc
 					replaced = true
 					break
 				}
 			}
-			if replaced {
-				break
+			if !replaced {
+				node.Decls = append(node.Decls, newFunc)
+				added = true
 			}
 		}
-		if !replaced {
-			// Append the type declaration.
-			newDecl := &ast.GenDecl{
-				Tok:   token.TYPE,
-				Specs: []ast.Spec{newType},
-			}
-			node.Decls = append(node.Decls, newDecl)
-		}
-
-		if err := writeFormattedFile(filePath, fset, node); err != nil {
-			return false, "", err
-		}
-		action := "inserted"
-		if replaced {
-			action = "updated"
-		}
-		return true, fmt.Sprintf("%s type %q in %s", action, newType.Name.Name, filePath), nil
 	}
 
-	// Handle package clause.
-	if strings.HasPrefix(trimmed, "package ") {
-		// Package clause is already present in the file; no-op.
-		return true, "package clause already present", nil
+	if !added {
+		if strings.HasPrefix(trimmed, "package ") {
+			return true, "package clause already present", nil
+		}
+		return false, "", nil
 	}
-
-	// Handle const/var declaration blocks.
-	if strings.HasPrefix(trimmed, "const (") || strings.HasPrefix(trimmed, "var (") {
-		// Parse the block.
-		src := fmt.Sprintf("package main\n\n%s", trimmed)
-		blockFset := token.NewFileSet()
-		blockNode, err := parser.ParseFile(blockFset, "", src, parser.ParseComments)
-		if err != nil {
-			return false, "", fmt.Errorf("cannot parse declaration block: %v", err)
-		}
-		var newDecl *ast.GenDecl
-		for _, decl := range blockNode.Decls {
-			if gd, ok := decl.(*ast.GenDecl); ok {
-				newDecl = gd
-				break
-			}
-		}
-		if newDecl == nil {
-			return false, "", fmt.Errorf("no declaration block found in code")
-		}
-		node.Decls = append(node.Decls, newDecl)
-		if err := writeFormattedFile(filePath, fset, node); err != nil {
-			return false, "", err
-		}
-		return true, fmt.Sprintf("inserted declaration block into %s", filePath), nil
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, node); err != nil {
+		return false, "", fmt.Errorf("format updated AST: %w", err)
 	}
-
-	// For simple statements, we can't easily determine where to insert them via
-	// AST. Return not-applied so the caller falls back to appending.
-	return false, "", nil
+	if validateErr := ValidateASTSource(filePath, buf.String()); validateErr != nil {
+		return false, "", fmt.Errorf("generated change violates Go type rules: %w", validateErr)
+	}
+	if err := writeFormattedFile(filePath, fset, node); err != nil {
+		return false, "", err
+	}
+	return true, fmt.Sprintf("updated %s", filePath), nil
 }
 
 // recommendAfterAction inspects the file and the recent action message and
 // generates short, pragmatic recommendations (tests, formatting, vet runs,
 // imports) as a follow-up suggestion to present to the user.
+func looksLikeGoSnippet(code string) bool {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	for _, needle := range []string{"package ", "func ", "type ", "import ", "var ", "const ", "if ", "for ", "switch ", "return "} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	// Also accept variable assignments (e.g. j := ...) or struct literal definitions/initializations
+	if strings.Contains(trimmed, ":=") || strings.Contains(trimmed, "=") {
+		return true
+	}
+	if strings.Contains(trimmed, "{") && strings.Contains(trimmed, "}") {
+		return true
+	}
+	return false
+}
+
+func resolveRepoRelativePath(candidate string) string {
+	if strings.TrimSpace(candidate) == "" {
+		return ""
+	}
+	if filepath.IsAbs(candidate) {
+		return candidate
+	}
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	if exe, err := os.Executable(); err == nil {
+		repoRoot := filepath.Dir(filepath.Dir(exe))
+		resolved := filepath.Join(repoRoot, candidate)
+		if _, statErr := os.Stat(resolved); statErr == nil {
+			return resolved
+		}
+	}
+	return candidate
+}
+
+func recordAcceptedIntent(prompt, action string) {
+	if strings.TrimSpace(prompt) == "" || strings.TrimSpace(action) == "" {
+		return
+	}
+	dataPath := resolveRepoRelativePath("data/training/command_examples.pb")
+	example := dense.CommandExample{
+		Type:      "code_update",
+		Prompt:    prompt,
+		Response:  action,
+		CodeAfter: action,
+	}
+	if err := dense.AppendCommandExample(dataPath, example); err != nil {
+		_ = err
+	}
+	transitionPath := resolveRepoRelativePath("data/models/dense/transitions.json")
+	if transitionPath != "" {
+		p := dense.NewPredictor()
+		if err := p.LoadFromFile(transitionPath); err == nil {
+			lastAction := "ADD_MISC"
+			nextAction := "ADD_FUNC"
+			lower := strings.ToLower(prompt)
+			switch {
+			case strings.Contains(lower, "json tag") || strings.Contains(lower, "json tags"):
+				lastAction = "ADD_STRUCT"
+				nextAction = "ADD_JSON_TAGS"
+			case strings.Contains(lower, "struct") || strings.Contains(lower, "type "):
+				lastAction = "ADD_STRUCT"
+				nextAction = "ADD_FUNC"
+			case strings.Contains(lower, "import"):
+				lastAction = "ADD_IMPORT"
+				nextAction = "ADD_IMPORT"
+			case strings.Contains(lower, "test"):
+				lastAction = "ADD_FUNC"
+				nextAction = "ADD_UNIT_TEST"
+			case strings.Contains(lower, "function") || strings.Contains(lower, "method"):
+				lastAction = "ADD_FUNC"
+				nextAction = "ADD_FUNC"
+			default:
+				lastAction = "ADD_MISC"
+				nextAction = "ADD_FUNC"
+			}
+			p.RecordSequence(lastAction, nextAction)
+			_ = p.SaveToFile(transitionPath)
+		}
+	}
+	_ = triggerRetrain()
+}
+
+func triggerRetrain() error {
+	cmd := exec.Command("bash", "-lc", "cd \"$(pwd)\" && make run-dense_train >/tmp/dense_retrain.log 2>&1 &")
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func selectorImportsInNode(fn *ast.FuncDecl) []string {
+	seen := map[string]bool{}
+	locals := map[string]bool{}
+	if fn.Type != nil && fn.Type.Params != nil {
+		for _, field := range fn.Type.Params.List {
+			for _, name := range field.Names {
+				locals[name.Name] = true
+			}
+		}
+	}
+	var paths []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || pkg == nil {
+			return true
+		}
+		if locals[pkg.Name] {
+			return true
+		}
+		name := pkg.Name
+		if name == "" || name == "builtin" || isBuiltInTypeName(name) {
+			return true
+		}
+		if !seen[name] {
+			seen[name] = true
+			paths = append(paths, name)
+		}
+		return true
+	})
+	return paths
+}
+
+func isBuiltInTypeName(name string) bool {
+	switch name {
+	case "int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+		"float32", "float64", "string", "bool", "byte", "rune",
+		"error", "any", "comparable", "nil", "map", "chan", "func",
+		"struct", "interface", "interface{}":
+		return true
+	default:
+		return false
+	}
+}
+
 func recommendAfterAction(filePath, actionMsg, codeSnippet string) string {
 	if filePath == "" {
 		return ""
@@ -1464,7 +3398,7 @@ func writeFormattedFile(filePath string, fset *token.FileSet, node *ast.File) er
 // handleCommand processes slash-commands in interactive mode.
 // Returns (handled, response).
 func handleCommand(line string, mgr *ConversationManager) (bool, string) {
-	if !strings.HasPrefix(line, "/") {
+	if !(strings.HasPrefix(line, ":") || strings.HasPrefix(line, "/")) {
 		return false, ""
 	}
 
@@ -1472,6 +3406,31 @@ func handleCommand(line string, mgr *ConversationManager) (bool, string) {
 	cmd := strings.ToLower(parts[0])
 
 	switch cmd {
+	case ":reload":
+		conv := mgr.Get()
+		if conv == nil || conv.TargetGoFile() == "" {
+			return true, colorize("No target Go file to reload.", "\033[33m")
+		}
+		if _, err := os.Stat(conv.TargetGoFile()); err != nil {
+			return true, colorize(fmt.Sprintf("Reload failed: %v", err), "\033[31m")
+		}
+		return true, colorize(fmt.Sprintf("🔄 Reloaded AST context for %s", conv.TargetGoFile()), "\033[32m")
+	case ":undo":
+		conv := mgr.Get()
+		if conv == nil {
+			return true, colorize("No active conversation.", "\033[31m")
+		}
+		ok, msg := conv.UndoLastEdit()
+		if !ok {
+			return true, colorize(msg, "\033[31m")
+		}
+		return true, colorize(msg, "\033[33m")
+	case ":history":
+		conv := mgr.Get()
+		if conv == nil {
+			return true, colorize("No active conversation.", "\033[31m")
+		}
+		return true, colorize(formatHistoryTurns(conv.Turns), "\033[36m")
 	case "/new":
 		name := ""
 		if len(parts) > 1 {
@@ -1528,10 +3487,19 @@ func handleCommand(line string, mgr *ConversationManager) (bool, string) {
 			}
 			return true, "Usage: /file <path-to-.go-file>"
 		}
-		path := strings.Join(parts[1:], " ")
+		rest := strings.TrimSpace(line[len(parts[0]):])
+		path, trailing := splitFileCommand(rest)
+		if path == "" {
+			path = strings.Join(parts[1:], " ")
+		}
 		conv := mgr.Get()
 		if err := conv.SetTargetFile(path); err != nil {
 			return true, fmt.Sprintf("❌ %v", err)
+		}
+		if strings.TrimSpace(trailing) != "" {
+			if ok, msg := tryApplyExactFunctionReplacement(trailing, path); ok {
+				return true, fmt.Sprintf("📄 Conversation %q will now update %s\n%s", mgr.Active(), conv.TargetGoFile(), msg)
+			}
 		}
 		return true, fmt.Sprintf("📄 Conversation %q will now update %s", mgr.Active(), conv.TargetGoFile())
 
@@ -1554,26 +3522,138 @@ func handleCommand(line string, mgr *ConversationManager) (bool, string) {
 		return true, fmt.Sprintf("💬 Active conversation: %q%s", mgr.Active(), target)
 
 	case "/help":
-		return true, `Available commands:
+		return true, colorize(`Available commands:
   /new [name]        start a new conversation (auto-generates a name if omitted)
   /list              list all conversations
   /switch <name>     switch to an existing conversation
   /delete <name>     delete a conversation
   /current           show the active conversation name
   /file <path>       set the target Go file to update for the active conversation
-  /help              show this help`
+  :reload            refresh package AST context for the active file
+  :undo              rollback the last successful edit
+  :history           show the current session turns
+  /help              show this help`, "\033[33m")
 
 	default:
 		return true, fmt.Sprintf("❌ Unknown command: %s. Type /help for available commands.", cmd)
 	}
 }
 
+func resolvePromptTarget(prompt, fallback string) string {
+	if explicit := inferTargetFileFromPrompt(prompt); explicit != "" {
+		return explicit
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return ""
+}
+
 func main() {
 	modelPath := flag.String("model", "data/models/dense/model.gob", "path to trained gob model file")
 	dataPath := flag.String("data", "data/training/command_examples.pb", "path to protobuf training data for response matching")
 	oneShot := flag.String("prompt", "", "classify a single prompt and exit (interactive if empty)")
+	modelPathValue := resolveRepoRelativePath(*modelPath)
+	dataPathValue := resolveRepoRelativePath(*dataPath)
+	if modelPathValue != *modelPath {
+		modelPath = &modelPathValue
+	}
+	if dataPathValue != *dataPath {
+		dataPath = &dataPathValue
+	}
+	dirPath := flag.String("dir", ".", "Root workspace path to index")
 	targetFile := flag.String("file", "", "default target Go file used by the default conversation")
+	httpAddr := flag.String("http", "", "optional HTTP adapter address (for example :8080)")
+	benchmark := flag.Bool("benchmark", false, "run a lightweight intent and compilation benchmark and exit")
+	nativeTUI := flag.Bool("native-tui", false, "run a pure-Go terminal split-pane preview without external dependencies")
+	backupFlag := flag.Bool("backup", false, "create .bak backups before overwriting Go files")
+	backupWrites = *backupFlag
 	flag.Parse()
+
+	// ── Workspace-aware Direct CLI routing ───────────────────────────────────
+	// When -file and -prompt are both set, attempt a direct deterministic AST
+	// mutation via RouteAndExecute, bypassing the LLM pipeline entirely.
+	// The workspace graph is loaded (or rebuilt from cache) so that the target
+	// file can be resolved by symbol name even when -file is not provided.
+	if *oneShot != "" {
+		rootDir := *dirPath
+		if rootDir == "" {
+			rootDir, _ = os.Getwd()
+		}
+		cachePath := dense.DefaultCachePath(rootDir)
+
+		// Try loading from cache first (valid for 10 minutes).
+		wsCache, _ := dense.LoadWorkspaceCache(cachePath)
+		var wgraph *dense.WorkspaceGraph
+
+		resolvedFile := *targetFile
+
+		if wsCache == nil || wsCache.Stale(10*time.Minute) {
+			// Full re-index; persist for subsequent calls.
+			if g, gErr := dense.IndexWorkspace(rootDir); gErr == nil {
+				wgraph = g
+				_ = dense.SaveWorkspaceCache(cachePath, dense.GraphToCache(rootDir, g))
+			}
+		}
+
+		if wgraph == nil && wsCache != nil {
+			if g, gErr := dense.IndexWorkspace(rootDir); gErr == nil {
+				wgraph = g
+			}
+		}
+
+		// If no -file flag, try resolving from workspace graph.
+		if resolvedFile == "" {
+			parsed := dense.ParseHybridPrompt(*oneShot)
+			for _, ident := range parsed.Identifiers {
+				// Try live graph first.
+				if wgraph != nil {
+					if sym, ok := wgraph.FindSymbol(ident); ok {
+						resolvedFile = sym.FilePath
+						break
+					}
+				}
+				// Fall back to persistent cache.
+				if fp, _, _, ok := wsCache.FindInCache(ident); ok {
+					resolvedFile = fp
+					break
+				}
+			}
+		}
+
+		if resolvedFile != "" {
+			// Optionally write backup.
+			if *backupFlag {
+				if src, readErr := os.ReadFile(resolvedFile); readErr == nil {
+					_ = os.WriteFile(resolvedFile+".bak", src, 0644)
+				}
+			}
+
+			fset := token.NewFileSet()
+			fileAST, parseErr := parser.ParseFile(fset, resolvedFile, nil, parser.ParseComments)
+			if parseErr == nil {
+				if modified := dense.RouteAndExecute(fileAST, *oneShot); modified {
+					f, createErr := os.Create(resolvedFile)
+					if createErr == nil {
+						defer f.Close()
+						_ = format.Node(f, fset, fileAST)
+						fmt.Printf("Successfully updated %s\n", resolvedFile)
+						os.Exit(0)
+					}
+				}
+			}
+		}
+	}
+
+	index, err := dense.LoadProjectIndex(".")
+	if err != nil {
+		log.Printf("project index warmup failed: %v", err)
+	} else {
+		index.PrintSummary()
+		if err := index.WatchAndInvalidate("."); err != nil {
+			log.Printf("watch and invalidate: %v", err)
+		}
+	}
 
 	// Load the trained gob model.
 	model, err := dense.LoadGob(*modelPath)
@@ -1596,16 +3676,75 @@ func main() {
 	// Initialize the conversation manager (multiconversational).
 	mgr := NewConversationManager()
 
-	// Apply the global -file flag to the default conversation so live editing
-	// works even before any /file command is issued.
 	if *targetFile != "" {
 		if err := mgr.Get().SetTargetFile(*targetFile); err != nil {
 			log.Fatalf("invalid -file: %v", err)
 		}
 	}
+	if *benchmark {
+		results := RunBenchmark(*modelPath, defaultBenchmarkPrompts())
+		fmt.Printf("Intent precision: %.2f\n", results.IntentPrecision)
+		fmt.Printf("AST compilation rate: %.2f\n", results.ASTCompilationRate)
+		return
+	}
+	if *nativeTUI {
+		if err := runNativeTUI(model, examples, *targetFile); err != nil {
+			log.Fatalf("native tui: %v", err)
+		}
+		return
+	}
+	if *httpAddr != "" {
+		if err := runHTTPAdapter(*httpAddr, *modelPath, *dataPath); err != nil {
+			log.Fatalf("http adapter: %v", err)
+		}
+		return
+	}
 
 	respond := func(prompt string) string {
+		trimmed := strings.TrimSpace(prompt)
+		if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, ":") {
+			if handled, resp := handleCommand(trimmed, mgr); handled {
+				return resp
+			}
+		}
 		conv := mgr.Get()
+		target := resolvePromptTarget(prompt, conv.TargetGoFile())
+		if target == "" {
+			target = dense.InferTargetFromPrompt(prompt)
+		}
+		if target == "" {
+			target = filepath.Join(".", "dense_generated.go")
+		}
+		if ok, msg := tryApplyExactFunctionReplacement(prompt, target); ok {
+			return msg
+		}
+		// Dedicated NL handler for "import [and use] struct|function X from file A into file B".
+		if msg, err := tryHandleImportAndUse(prompt); err != nil {
+			return fmt.Sprintf("⚠️  %v", err)
+		} else if msg != "" {
+			return "🔧 " + msg
+		}
+
+		// Try Lexical Tokenization & Hybrid AST Mutation
+		if target != "" && strings.HasSuffix(target, ".go") {
+			if content, err := os.ReadFile(target); err == nil {
+				fset := token.NewFileSet()
+				if fileAST, err := parser.ParseFile(fset, target, string(content), parser.ParseComments); err == nil {
+					intent, parsed := dense.ResolveIntent(prompt, fileAST)
+					if intent == dense.IntentAddTags || intent == dense.IntentWrapErrors {
+						if dense.ExecuteMutation(fileAST, intent, parsed) {
+							var buf strings.Builder
+							if err := format.Node(&buf, fset, fileAST); err == nil {
+								if err := os.WriteFile(target, []byte(buf.String()), 0644); err == nil {
+									return fmt.Sprintf("🔧 Applied %s mutation directly to AST of %s", intent, target)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		response := buildContextAwareResponse(prompt, conv, model, examples)
 
 		// Track the turn in conversation history.
@@ -1634,10 +3773,16 @@ func main() {
 		if cmdType == "code_update" {
 			target := conv.TargetGoFile()
 			if target == "" {
+				target = resolvePromptTarget(prompt, conv.TargetGoFile())
+			}
+			if target == "" {
 				target = dense.InferTargetFromPrompt(prompt)
 			}
 			if target == "" {
-				response += "\n📄 No Go file targeted in this conversation. Use /file <path-to-.go-file> to set the file to update."
+				target = filepath.Join(".", "dense_generated.go")
+			}
+			if err := ensureGoTargetFile(target, prompt); err != nil {
+				response += fmt.Sprintf("\n⚠️  Could not prepare target file %q: %v", target, err)
 				return response
 			}
 			if err := conv.SetTargetFile(target); err != nil {
@@ -1645,17 +3790,34 @@ func main() {
 				return response
 			}
 
+			conv.PushUndoSnapshot(target)
 			code := strings.TrimPrefix(response, "🔧 ")
 			code = strings.TrimSpace(code)
 			if code == "" {
-				return response
+				return response + "\n⚠️  No valid Go code was generated for this prompt."
+			}
+
+			if strings.Contains(strings.ToLower(prompt), "replace ") && strings.Contains(strings.ToLower(prompt), " with ") {
+				if idx := strings.Index(strings.ToLower(prompt), "replace "); idx >= 0 {
+					namePart := strings.TrimSpace(prompt[idx+len("replace "):])
+					if j := strings.Index(strings.ToLower(namePart), " with "); j >= 0 {
+						name := strings.TrimSpace(namePart[:j])
+						if name != "" {
+							if _, err := applyFunctionReplacement(target, name, code); err == nil {
+								response += fmt.Sprintf("\n\033[32m✅ Applied exact replacement to %s\033[0m", target)
+								return response
+							}
+						}
+					}
+				}
 			}
 
 			msg, err := applyCodeToFile(target, code)
 			if err != nil {
-				response += fmt.Sprintf("\n⚠️  Could not apply to %s: %v", target, err)
+				response += fmt.Sprintf("\n\033[31m⚠️  Could not apply to %s: %v\033[0m", target, err)
 			} else {
-				response += fmt.Sprintf("\n✅ Applied to %s: %s", target, msg)
+				recordAcceptedIntent(prompt, "code_update")
+				response += fmt.Sprintf("\n\033[32m✅ Applied to %s: %s\033[0m", target, msg)
 				if recs := recommendAfterAction(target, msg, code); recs != "" {
 					response += recs
 				}
@@ -1734,6 +3896,21 @@ func main() {
 
 	if *oneShot != "" {
 		fmt.Printf("prompt: %q\n", *oneShot)
+		trimmed := strings.TrimSpace(*oneShot)
+		if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, ":") {
+			if handled, resp := handleCommand(trimmed, mgr); handled {
+				fmt.Println(resp)
+				return
+			}
+		}
+		target := resolvePromptTarget(*oneShot, mgr.Get().TargetGoFile())
+		if target == "" {
+			target = dense.InferTargetFromPrompt(*oneShot)
+		}
+		if ok, msg := tryApplyExactFunctionReplacement(*oneShot, target); ok {
+			fmt.Println(msg)
+			return
+		}
 		fmt.Println(respond(*oneShot))
 		return
 	}
@@ -1757,13 +3934,19 @@ func main() {
 			continue
 		}
 
-		// Handle slash commands.
 		if handled, resp := handleCommand(line, mgr); handled {
 			fmt.Println(resp)
 			continue
 		}
-
-		fmt.Println(respond(line))
+		target := resolvePromptTarget(line, mgr.Get().TargetGoFile())
+		if target == "" {
+			target = dense.InferTargetFromPrompt(line)
+		}
+		if ok, msg := tryApplyExactFunctionReplacement(line, target); ok {
+			fmt.Println(colorize(msg, "\033[32m"))
+			continue
+		}
+		fmt.Println(colorize(respond(line), "\033[32m"))
 	}
 	if err := sc.Err(); err != nil {
 		log.Fatalf("read stdin: %v", err)

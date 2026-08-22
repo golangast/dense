@@ -12,6 +12,14 @@ import (
 )
 
 // LoadCommandExamplesFromCSV reads CommandExample records from a CSV file.
+func LoadModel(path string) (*DenseModel, error) {
+	return LoadGob(path)
+}
+
+func LoadCSV(path string) ([]CommandExample, error) {
+	return LoadCommandExamplesFromCSV(path)
+}
+
 func LoadCommandExamplesFromCSV(path string) ([]CommandExample, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -160,6 +168,158 @@ func LoadCommandExamplesFromProto(path string) ([]CommandExample, error) {
 		}
 	}
 	return examples, nil
+}
+
+func AppendCommandExample(path string, example CommandExample) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("empty dataset path")
+	}
+	if strings.HasSuffix(path, ".pb") {
+		examples, err := LoadCommandExamplesFromProto(path)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("load proto examples: %w", err)
+		}
+		examples = append(examples, example)
+		pbExamples := make([]*trainingpb.CommandExample, 0, len(examples))
+		for _, e := range examples {
+			pbExamples = append(pbExamples, &trainingpb.CommandExample{
+				Type:              e.Type,
+				UserPrompt:        e.Prompt,
+				AssistantResponse: e.Response,
+				CodeAfter:         e.CodeAfter,
+			})
+		}
+		return trainingpb.SaveCommandExamplesToProto(path, pbExamples)
+	}
+
+	examples, err := LoadCommandExamplesFromCSV(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("load csv examples: %w", err)
+	}
+	examples = append(examples, example)
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create csv: %w", err)
+	}
+	defer f.Close()
+	writer := csv.NewWriter(f)
+	if err := writer.Write([]string{"type", "prompt", "response", "code_after"}); err != nil {
+		return fmt.Errorf("write csv header: %w", err)
+	}
+	for _, e := range examples {
+		if err := writer.Write([]string{e.Type, e.Prompt, e.Response, e.CodeAfter}); err != nil {
+			return fmt.Errorf("write csv row: %w", err)
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("flush csv: %w", err)
+	}
+	return nil
+}
+
+// NormalizePrompt strips insignificant whitespace and casing so duplicates can be collapsed reliably.
+func NormalizePrompt(prompt string) string {
+	trimmed := strings.TrimSpace(prompt)
+	lower := strings.ToLower(trimmed)
+	var b strings.Builder
+	for _, r := range lower {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == ' ' || r == '_' || r == '-' {
+			if r == ' ' {
+				if b.Len() > 0 && b.String()[b.Len()-1] != ' ' {
+					b.WriteRune(r)
+				}
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(strings.Join(strings.Fields(b.String()), " "))
+}
+
+// DeduplicateCommandExamples drops near-duplicate prompts while preserving the first valid example via a normalized prompt key.
+func DeduplicateCommandExamples(examples []CommandExample) []CommandExample {
+	seen := make(map[string]bool)
+	unique := make([]CommandExample, 0, len(examples))
+	for _, ex := range examples {
+		if ex.Prompt == "" {
+			continue
+		}
+		normalized := NormalizePrompt(ex.Prompt)
+		if seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		unique = append(unique, ex)
+	}
+	return unique
+}
+
+// BalanceClassDistribution keeps a capped sample count per class so dominant classes do not overwhelm the classifier.
+func BalanceClassDistribution(examples []CommandExample, maxPerClass int) []CommandExample {
+	if maxPerClass <= 0 {
+		maxPerClass = 1
+	}
+	counts := make(map[string]int)
+	balanced := make([]CommandExample, 0, len(examples))
+	for _, ex := range examples {
+		label := strings.TrimSpace(ex.Type)
+		if label == "" {
+			label = "social"
+		}
+		if counts[label] >= maxPerClass {
+			continue
+		}
+		counts[label]++
+		balanced = append(balanced, ex)
+	}
+	return balanced
+}
+
+// CleanDataset is a small hygiene pass that removes duplicates and balances the class distribution.
+func CleanDataset(examples []CommandExample, maxPerClass int) []CommandExample {
+	unique := DeduplicateCommandExamples(examples)
+	if maxPerClass > 0 {
+		return BalanceClassDistribution(unique, maxPerClass)
+	}
+	return unique
+}
+
+// SaveCSV writes a cleaned command dataset back to CSV format.
+func SaveCSV(path string, examples []CommandExample) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create csv: %w", err)
+	}
+	defer f.Close()
+	writer := csv.NewWriter(f)
+	if err := writer.Write([]string{"type", "prompt", "response", "code_after"}); err != nil {
+		return fmt.Errorf("write csv header: %w", err)
+	}
+	for _, e := range examples {
+		if err := writer.Write([]string{e.Type, e.Prompt, e.Response, e.CodeAfter}); err != nil {
+			return fmt.Errorf("write csv row: %w", err)
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("flush csv: %w", err)
+	}
+	return nil
+}
+
+// SaveProto writes cleaned examples back to protobuf.
+func SaveProto(path string, examples []CommandExample) error {
+	pbExamples := make([]*trainingpb.CommandExample, 0, len(examples))
+	for _, ex := range examples {
+		pbExamples = append(pbExamples, &trainingpb.CommandExample{
+			Type:              ex.Type,
+			UserPrompt:        ex.Prompt,
+			AssistantResponse: ex.Response,
+			CodeAfter:         ex.CodeAfter,
+		})
+	}
+	return trainingpb.SaveCommandExamplesToProto(path, pbExamples)
 }
 
 // SaveGob serializes the DenseModel to a gob file.
