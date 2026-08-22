@@ -212,7 +212,31 @@ func RouteAndExecuteWorkspaceWithCodeAwareSlot(graph *WorkspaceGraph, targetFile
 	}
 
 	switch slot.Action {
+	case "ADD_CONTEXT":
+		return actualFile, EnsureContextParamInFile(fileAST, slot.TargetSymbol)
+	case "WRAP_ERRORS":
+		return actualFile, WrapReturnErrorsInFile(fileAST, slot.TargetSymbol)
 	case "ADD_FUNC":
+		return actualFile, AppendFunctionDecl(fileAST, slot.PayloadCode)
+	case "ADD_TYPE":
+		return actualFile, AppendTypeDecl(fileAST, slot.PayloadCode)
+	case "ADD_INTERFACE":
+		return actualFile, AppendTypeDecl(fileAST, slot.PayloadCode)
+	case "ADD_VAR":
+		return actualFile, AppendVarDecl(fileAST, slot.PayloadCode)
+	case "ADD_CONST":
+		return actualFile, AppendConstDecl(fileAST, slot.PayloadCode)
+	case "ADD_DECL":
+		return actualFile, AppendGenericDecl(fileAST, slot.PayloadCode)
+	case "ADD_STMT":
+		return actualFile, AppendFunctionDecl(fileAST, slot.PayloadCode)
+	case "GENERATE_CONSTRUCTOR":
+		code, ok := GenerateConstructorCode(fileAST, slot.TargetSymbol)
+		if !ok {
+			return actualFile, false
+		}
+		return actualFile, AppendFunctionDecl(fileAST, code)
+	case "ADD_METHOD":
 		return actualFile, AppendFunctionDecl(fileAST, slot.PayloadCode)
 	case "REPLACE":
 		return actualFile, ReplaceFunctionDecl(fileAST, slot.TargetSymbol, slot.PayloadCode)

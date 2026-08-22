@@ -2702,107 +2702,134 @@ func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.D
 // import path, then adds the import declaration and a usage snippet to the destination
 // file. Returns ("", nil) if the prompt does not match the pattern.
 func tryHandleImportAndUse(prompt string) (string, error) {
-	lower := strings.ToLower(strings.TrimSpace(prompt))
+	return tryHandleImportAndUseWithDir(prompt, ".")
+}
 
-	// Must contain "import" and ("from" or "into") to be a candidate.
-	if !strings.Contains(lower, "import") || !strings.Contains(lower, "into") {
+func tryHandleImportAndUseWithDir(prompt, baseDir string) (string, error) {
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+	if !strings.Contains(lower, "import") || (!strings.Contains(lower, "into") && !strings.Contains(lower, "to ")) {
 		return "", nil
 	}
 
-	// Determine symbol kind: "struct" or "function"
-	symbolKind := "" // "struct" or "func"
-	if strings.Contains(lower, "struct") {
+	symbolKind := ""
+	switch {
+	case strings.Contains(lower, "struct"):
 		symbolKind = "struct"
-	} else if strings.Contains(lower, "function") || strings.Contains(lower, "func") {
+	case strings.Contains(lower, "interface"):
+		symbolKind = "interface"
+	case strings.Contains(lower, "map"):
+		symbolKind = "map"
+	case strings.Contains(lower, "slice"):
+		symbolKind = "slice"
+	case strings.Contains(lower, "var"):
+		symbolKind = "var"
+	case strings.Contains(lower, "function") || strings.Contains(lower, "func"):
 		symbolKind = "func"
 	}
+	if symbolKind == "" {
+		return "", nil
+	}
 
-	// Extract symbol name based on kind.
 	symbolName := ""
 	switch symbolKind {
 	case "struct":
 		if m := regexp.MustCompile(`(?i)struct\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
 			symbolName = m[1]
 		}
+	case "interface":
+		if m := regexp.MustCompile(`(?i)interface\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
+			symbolName = m[1]
+		}
+	case "map":
+		if m := regexp.MustCompile(`(?i)map\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
+			symbolName = m[1]
+		}
+	case "slice":
+		if m := regexp.MustCompile(`(?i)slice\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
+			symbolName = m[1]
+		}
+	case "var":
+		if m := regexp.MustCompile(`(?i)var\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
+			symbolName = m[1]
+		}
 	case "func":
-		// "function <Name>" or "func <Name>"
 		if m := regexp.MustCompile(`(?i)(?:function|func)\s+([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(prompt); len(m) >= 2 {
 			symbolName = m[1]
 		}
-	default:
-		// Neither struct nor function mentioned — not our pattern.
+	}
+	if symbolName == "" {
 		return "", nil
 	}
 
-	// Extract source file: look for "from [file] <path.go>"
 	srcFile := ""
 	if m := regexp.MustCompile(`(?i)from\s+(?:file\s+)?([A-Za-z0-9_./-]+\.go)`).FindStringSubmatch(prompt); len(m) >= 2 {
 		srcFile = m[1]
 	}
-
-	// Extract destination file: look for "into [file] <path.go>"
-	dstFile := ""
-	if m := regexp.MustCompile(`(?i)into\s+(?:file\s+)?([A-Za-z0-9_./-]+\.go)`).FindStringSubmatch(prompt); len(m) >= 2 {
-		dstFile = m[1]
+	if srcFile == "" {
+		if match := regexp.MustCompile(`(?i)(?:file\s+)?([A-Za-z0-9_./-]+\.go)`).FindString(prompt); match != "" {
+			srcFile = match
+		}
+	}
+	if srcFile == "" {
+		if found, err := findSourceFileForSymbol(symbolName); err == nil && found != "" {
+			srcFile = found
+		}
 	}
 
-	// If we don't have all required parts, bail out — not our pattern.
+	dstFile := ""
+	if m := regexp.MustCompile(`(?i)(?:into|to)\s+(?:file\s+)?([A-Za-z0-9_./-]+\.go)`).FindStringSubmatch(prompt); len(m) >= 2 {
+		dstFile = m[1]
+	}
+	if dstFile == "" {
+		if match := regexp.MustCompile(`(?i)(?:file\s+)?([A-Za-z0-9_./-]+\.go)$`).FindString(prompt); match != "" {
+			dstFile = match
+		}
+	}
 	if symbolName == "" || srcFile == "" || dstFile == "" {
 		return "", nil
 	}
 
-	// Make paths absolute relative to cwd.
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("getwd: %w", err)
 	}
+	if baseDir == "" {
+		baseDir = cwd
+	} else if !filepath.IsAbs(baseDir) {
+		baseDir = filepath.Join(cwd, baseDir)
+	}
 	if !filepath.IsAbs(srcFile) {
-		srcFile = filepath.Join(cwd, srcFile)
+		srcFile = filepath.Join(baseDir, srcFile)
 	}
 	if !filepath.IsAbs(dstFile) {
-		dstFile = filepath.Join(cwd, dstFile)
+		dstFile = filepath.Join(baseDir, dstFile)
 	}
 
-	// Read and parse the source file.
 	srcBytes, err := os.ReadFile(srcFile)
 	if err != nil {
 		return "", fmt.Errorf("read source file %s: %w", srcFile, err)
 	}
 	srcContent := string(srcBytes)
 
-	// Verify the symbol exists.
+	declText := ""
 	switch symbolKind {
-	case "struct":
-		if !strings.Contains(srcContent, "type "+symbolName+" struct") {
-			return "", fmt.Errorf("struct %q not found in %s", symbolName, srcFile)
+	case "struct", "interface", "map", "slice":
+		declText = extractGeneralDeclaration(srcContent, symbolName, symbolKind)
+		if declText == "" {
+			return "", fmt.Errorf("%s %q not found in %s", symbolKind, symbolName, srcFile)
+		}
+	case "var":
+		declText = extractVarDeclaration(srcContent, symbolName)
+		if declText == "" {
+			return "", fmt.Errorf("var %q not found in %s", symbolName, srcFile)
 		}
 	case "func":
-		funcRe := regexp.MustCompile(`(?m)^func\s+` + regexp.QuoteMeta(symbolName) + `\s*\(`)
-		if !funcRe.MatchString(srcContent) {
+		declText = extractFunctionDeclaration(srcContent, symbolName)
+		if declText == "" {
 			return "", fmt.Errorf("function %q not found in %s", symbolName, srcFile)
 		}
 	}
 
-	// Determine the package name of the source file.
-	srcFset := token.NewFileSet()
-	srcAST, err := parser.ParseFile(srcFset, srcFile, srcContent, 0)
-	if err != nil {
-		return "", fmt.Errorf("parse source file: %w", err)
-	}
-	srcPkgName := srcAST.Name.Name
-
-	// Resolve the full module import path for the source directory.
-	srcDir := filepath.Dir(srcFile)
-	importPath, err := resolveModuleImportPath(srcDir)
-	if err != nil {
-		rel, relErr := filepath.Rel(cwd, srcDir)
-		if relErr != nil || rel == "" || rel == "." {
-			return "", fmt.Errorf("resolve import path for %s: %w", srcDir, err)
-		}
-		importPath = rel
-	}
-
-	// Ensure the destination file exists.
 	if _, statErr := os.Stat(dstFile); os.IsNotExist(statErr) {
 		if writeErr := os.MkdirAll(filepath.Dir(dstFile), 0755); writeErr != nil {
 			return "", fmt.Errorf("mkdir: %w", writeErr)
@@ -2816,64 +2843,86 @@ func tryHandleImportAndUse(prompt string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read dest file: %w", err)
 	}
+	if strings.Contains(string(dstBytes), declText) {
+		return fmt.Sprintf("✅ %s already present in %s", symbolName, dstFile), nil
+	}
 
-	dstFset := token.NewFileSet()
-	dstNode, err := parser.ParseFile(dstFset, dstFile, string(dstBytes), parser.ParseComments)
+	updated := strings.TrimRight(string(dstBytes), "\n") + "\n\n" + declText + "\n"
+	if err := os.WriteFile(dstFile, []byte(updated), 0644); err != nil {
+		return "", fmt.Errorf("write declaration: %w", err)
+	}
+	return fmt.Sprintf("✅ Imported %s into %s", symbolName, dstFile), nil
+}
+
+func findSourceFileForSymbol(symbolName string) (string, error) {
+	cwd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("parse dest file: %w", err)
+		return "", err
 	}
-
-	// Add the import if not already present.
-	alreadyImported := false
-	for _, imp := range dstNode.Imports {
-		if imp.Path != nil && strings.Trim(imp.Path.Value, `"`) == importPath {
-			alreadyImported = true
-			break
+	var match string
+	err = filepath.Walk(cwd, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || filepath.Ext(path) != ".go" {
+			return nil
 		}
-	}
-	if !alreadyImported {
-		astutil.AddImport(dstFset, dstNode, importPath)
-	}
-
-	// Build a usage snippet based on symbol kind.
-	qualifiedSymbol := srcPkgName + "." + symbolName
-	alreadyUsed := strings.Contains(string(dstBytes), qualifiedSymbol)
-	var usageDecl string
-	switch symbolKind {
-	case "struct":
-		varName := strings.ToLower(string([]rune(symbolName)[:1])) + symbolName[1:] + "Instance"
-		usageDecl = fmt.Sprintf("var %s = %s{}", varName, qualifiedSymbol)
-	case "func":
-		// Wrap in a top-level var using a function call result, or a simple _ = call.
-		// Since we don't know the return type, use `var _ = func() { <pkg>.<Func>() }` pattern.
-		usageDecl = fmt.Sprintf("var _ = func() { %s() }()", qualifiedSymbol)
-	}
-
-	// Write the import.
-	if !alreadyImported {
-		var buf strings.Builder
-		if fmtErr := format.Node(&buf, dstFset, dstNode); fmtErr != nil {
-			return "", fmt.Errorf("format after import: %w", fmtErr)
-		}
-		if writeErr := os.WriteFile(dstFile, []byte(buf.String()), 0644); writeErr != nil {
-			return "", fmt.Errorf("write after import: %w", writeErr)
-		}
-	}
-
-	// Append the usage snippet if not already present.
-	if !alreadyUsed && usageDecl != "" {
-		updatedBytes, readErr := os.ReadFile(dstFile)
+		content, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return "", fmt.Errorf("re-read after import: %w", readErr)
+			return nil
 		}
-		updatedContent := strings.TrimRight(string(updatedBytes), "\n") + "\n\n" + usageDecl + "\n"
-		if writeErr := os.WriteFile(dstFile, []byte(updatedContent), 0644); writeErr != nil {
-			return "", fmt.Errorf("write usage snippet: %w", writeErr)
+		if strings.Contains(string(content), "type "+symbolName+" struct") || strings.Contains(string(content), "func "+symbolName+" ") {
+			match = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if match == "" {
+		return "", fmt.Errorf("symbol %s not found", symbolName)
+	}
+	return match, nil
+}
+
+func extractGeneralDeclaration(srcContent, symbolName, kind string) string {
+	switch kind {
+	case "struct":
+		pattern := regexp.MustCompile(`(?s)type\s+` + regexp.QuoteMeta(symbolName) + `\s+struct\s*\{.*?\n\}`)
+		if m := pattern.FindString(srcContent); m != "" {
+			return m
+		}
+	case "interface":
+		pattern := regexp.MustCompile(`(?s)type\s+` + regexp.QuoteMeta(symbolName) + `\s+interface\s*\{.*?\n\}`)
+		if m := pattern.FindString(srcContent); m != "" {
+			return m
+		}
+	case "map":
+		pattern := regexp.MustCompile(`(?s)type\s+` + regexp.QuoteMeta(symbolName) + `\s+map\[[^\]]+\].*?\n`)
+		if m := pattern.FindString(srcContent); m != "" {
+			return m
+		}
+	case "slice":
+		pattern := regexp.MustCompile(`(?s)type\s+` + regexp.QuoteMeta(symbolName) + `\s+\[\].*?\n`)
+		if m := pattern.FindString(srcContent); m != "" {
+			return m
 		}
 	}
+	return ""
+}
 
-	result := fmt.Sprintf("✅ Added import %q and usage `%s` to %s", importPath, usageDecl, dstFile)
-	return result, nil
+func extractVarDeclaration(srcContent, symbolName string) string {
+	pattern := regexp.MustCompile(`(?ms)^var\s+` + regexp.QuoteMeta(symbolName) + `\s*=.*?$`)
+	if m := pattern.FindString(srcContent); m != "" {
+		return strings.TrimRight(m, "\n")
+	}
+	return ""
+}
+
+func extractFunctionDeclaration(srcContent, symbolName string) string {
+	pattern := regexp.MustCompile(`(?ms)^func\s+` + regexp.QuoteMeta(symbolName) + `\s*\([^\)]*\)\s*(?:\([^\)]*\)|[A-Za-z_][A-Za-z0-9_]*)?\s*\{.*?^\}`)
+	if m := pattern.FindString(srcContent); m != "" {
+		return m
+	}
+	return ""
 }
 
 // resolveModuleImportPath finds the full Go module import path for a given directory
@@ -3719,6 +3768,12 @@ func main() {
 	backupWrites = *backupFlag
 	flag.Parse()
 
+	// If prompt is empty, start interactive REPL.
+	if *oneShot == "" {
+		RunInteractiveREPL(*dirPath)
+		os.Exit(0)
+	}
+
 	// ── Workspace-aware Direct CLI routing ───────────────────────────────────
 	// When -file and -prompt are both set, attempt a direct deterministic AST
 	// mutation via RouteAndExecute, bypassing the LLM pipeline entirely.
@@ -3888,7 +3943,7 @@ func main() {
 			return msg
 		}
 		// Dedicated NL handler for "import [and use] struct|function X from file A into file B".
-		if msg, err := tryHandleImportAndUse(prompt); err != nil {
+		if msg, err := tryHandleImportAndUseWithDir(prompt, "."); err != nil {
 			return fmt.Sprintf("⚠️  %v", err)
 		} else if msg != "" {
 			return "🔧 " + msg

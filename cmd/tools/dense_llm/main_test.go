@@ -15,6 +15,36 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 )
 
+func TestPersistWorkspaceMutation_WritesAddFuncToDisk(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "jim.go")
+	if err := os.WriteFile(filePath, []byte("package main\n\nfunc sally() int {\n\treturn 3\n}\n"), 0644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	graph, err := dense.IndexWorkspace(dir)
+	if err != nil {
+		t.Fatalf("index workspace: %v", err)
+	}
+
+	slot := dense.ParseCodeAwarePrompt("add function joker to jim.go", graph)
+	target, ok := dense.RouteAndExecuteWorkspaceWithCodeAwareSlot(graph, filePath, slot)
+	if !ok {
+		t.Fatal("RouteAndExecuteWorkspaceWithCodeAwareSlot should apply ADD_FUNC")
+	}
+	if err := persistWorkspaceMutation(target, graph); err != nil {
+		t.Fatalf("persistWorkspaceMutation returned error: %v", err)
+	}
+
+	contents, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read updated file: %v", err)
+	}
+	if !strings.Contains(string(contents), "func Joker()") {
+		t.Fatalf("updated file should contain Joker function, got: %s", contents)
+	}
+}
+
 func TestFunctionSnippetFromPrompt(t *testing.T) {
 	prompt := "add function jim to file jim/jim.go"
 	got := functionSnippetFromPrompt(prompt)
@@ -183,6 +213,82 @@ func TestApplyFunctionReplacement_UpdatesGoFile(t *testing.T) {
 	}
 	if !strings.Contains(string(contents), `return "jim"`) {
 		t.Fatalf("updated file should contain new return value, got: %s", contents)
+	}
+}
+
+func TestHandleInteractivePrompt_ImportStructPrompt(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "jim", "jake.go")
+	dstPath := filepath.Join(dir, "jim", "jim.go")
+	if err := os.MkdirAll(filepath.Dir(srcPath), 0755); err != nil {
+		t.Fatalf("mkdir src dir: %v", err)
+	}
+	if err := os.WriteFile(srcPath, []byte("package jim\n\ntype Eeid struct {\n\tName string\n\tAge int\n}\n"), 0644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := os.WriteFile(dstPath, []byte("package jim\n"), 0644); err != nil {
+		t.Fatalf("write destination: %v", err)
+	}
+
+	msg, ok := handleInteractivePrompt(dir, "import struct Eeid from jim/jake.go into jim/jim.go")
+	if !ok {
+		t.Fatalf("handleInteractivePrompt should accept import prompt: %s", msg)
+	}
+	if !strings.Contains(msg, "Imported Eeid") {
+		t.Fatalf("expected import success message, got: %s", msg)
+	}
+	updated, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("read destination: %v", err)
+	}
+	if !strings.Contains(string(updated), "type Eeid struct") {
+		t.Fatalf("destination should contain the imported struct declaration, got: %s", string(updated))
+	}
+}
+
+func TestHandleInteractivePrompt_ImportOtherDeclarations(t *testing.T) {
+	tests := []struct {
+		name     string
+		prompt   string
+		source   string
+		contains string
+	}{
+		{name: "interface", prompt: "import interface Greeter from jim/jake.go into jim/jim.go", source: "package jim\n\ntype Greeter interface {\n\tGreet() string\n}\n", contains: "type Greeter interface"},
+		{name: "var", prompt: "import var Config from jim/jake.go into jim/jim.go", source: "package jim\n\nvar Config = map[string]string{\"name\": \"demo\"}\n", contains: "var Config = map"},
+		{name: "slice", prompt: "import slice Names from jim/jake.go into jim/jim.go", source: "package jim\n\ntype Names []string\n", contains: "type Names []string"},
+		{name: "map", prompt: "import map Metadata from jim/jake.go into jim/jim.go", source: "package jim\n\ntype Metadata map[string]int\n", contains: "type Metadata map"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			srcPath := filepath.Join(dir, "jim", "jake.go")
+			dstPath := filepath.Join(dir, "jim", "jim.go")
+			if err := os.MkdirAll(filepath.Dir(srcPath), 0755); err != nil {
+				t.Fatalf("mkdir src dir: %v", err)
+			}
+			if err := os.WriteFile(srcPath, []byte(tc.source), 0644); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			if err := os.WriteFile(dstPath, []byte("package jim\n"), 0644); err != nil {
+				t.Fatalf("write destination: %v", err)
+			}
+
+			msg, ok := handleInteractivePrompt(dir, tc.prompt)
+			if !ok {
+				t.Fatalf("handleInteractivePrompt should accept prompt %q: %s", tc.prompt, msg)
+			}
+			updated, err := os.ReadFile(dstPath)
+			if err != nil {
+				t.Fatalf("read destination: %v", err)
+			}
+			if !strings.Contains(string(updated), tc.contains) {
+				t.Fatalf("destination should contain %q after %q, got: %s", tc.contains, tc.prompt, string(updated))
+			}
+			if !strings.Contains(msg, "Imported") {
+				t.Fatalf("expected import success message, got: %s", msg)
+			}
+		})
 	}
 }
 

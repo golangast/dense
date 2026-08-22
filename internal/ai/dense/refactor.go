@@ -297,8 +297,11 @@ func AppendFunctionDecl(file *ast.File, rawSnippet string) bool {
 	}
 	fset := token.NewFileSet()
 	// Parse as a small file with package and function(s)
-	snippet := "package dummy\nfunc " + rawSnippet
-	parsed, err := parser.ParseFile(fset, "", snippet, 0)
+	snippet := strings.TrimSpace(rawSnippet)
+	if !strings.HasPrefix(strings.ToLower(snippet), "func ") {
+		snippet = "func " + snippet
+	}
+	parsed, err := parser.ParseFile(fset, "", "package dummy\n"+snippet, 0)
 	if err != nil || len(parsed.Decls) == 0 {
 		return false
 	}
@@ -309,6 +312,127 @@ func AppendFunctionDecl(file *ast.File, rawSnippet string) bool {
 			file.Decls = append(file.Decls, fd)
 			return true
 		}
+	}
+	return false
+}
+
+// AppendTypeDecl parses a raw type declaration and appends it to the file AST.
+func AppendTypeDecl(file *ast.File, rawSnippet string) bool {
+	if file == nil || strings.TrimSpace(rawSnippet) == "" {
+		return false
+	}
+	fset := token.NewFileSet()
+	snippet := strings.TrimSpace(rawSnippet)
+	if !strings.HasPrefix(strings.ToLower(snippet), "type ") {
+		snippet = "type " + snippet
+	}
+	parsed, err := parser.ParseFile(fset, "", "package dummy\n"+snippet, 0)
+	if err != nil || len(parsed.Decls) == 0 {
+		return false
+	}
+	for _, d := range parsed.Decls {
+		if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
+			file.Decls = append(file.Decls, gd)
+			return true
+		}
+	}
+	return false
+}
+
+// AppendConstDecl parses a raw const declaration and appends it to the file AST.
+func AppendConstDecl(file *ast.File, rawSnippet string) bool {
+	if file == nil || strings.TrimSpace(rawSnippet) == "" {
+		return false
+	}
+	fset := token.NewFileSet()
+	snippet := strings.TrimSpace(rawSnippet)
+	if !strings.HasPrefix(strings.ToLower(snippet), "const ") {
+		snippet = "const " + snippet
+	}
+	parsed, err := parser.ParseFile(fset, "", "package dummy\n"+snippet, 0)
+	if err != nil || len(parsed.Decls) == 0 {
+		return false
+	}
+	for _, d := range parsed.Decls {
+		if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.CONST {
+			file.Decls = append(file.Decls, gd)
+			return true
+		}
+	}
+	return false
+}
+
+// AppendVarDecl parses a raw variable declaration and appends it to the file AST.
+func AppendVarDecl(file *ast.File, rawSnippet string) bool {
+	if file == nil || strings.TrimSpace(rawSnippet) == "" {
+		return false
+	}
+	fset := token.NewFileSet()
+	snippet := strings.TrimSpace(rawSnippet)
+	if !strings.HasPrefix(strings.ToLower(snippet), "var ") {
+		snippet = "var " + snippet
+	}
+	parsed, err := parser.ParseFile(fset, "", "package dummy\n"+snippet, 0)
+	if err != nil || len(parsed.Decls) == 0 {
+		return false
+	}
+	for _, d := range parsed.Decls {
+		if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.VAR {
+			file.Decls = append(file.Decls, gd)
+			return true
+		}
+	}
+	return false
+}
+
+// AppendGenericDecl accepts a code snippet and appends whichever top-level declaration it contains.
+func AppendGenericDecl(file *ast.File, rawSnippet string) bool {
+	if file == nil || strings.TrimSpace(rawSnippet) == "" {
+		return false
+	}
+	snippet := strings.TrimSpace(rawSnippet)
+	if snippet == "" {
+		return false
+	}
+
+	fset := token.NewFileSet()
+	candidates := []string{snippet}
+	if !strings.HasPrefix(strings.ToLower(snippet), "package ") {
+		candidates = []string{"package dummy\n" + snippet, snippet}
+	}
+
+	for _, candidate := range candidates {
+		parsed, err := parser.ParseFile(fset, "", candidate, 0)
+		if err != nil {
+			continue
+		}
+
+		for _, d := range parsed.Decls {
+			if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.IMPORT {
+				continue
+			}
+			if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.PACKAGE {
+				continue
+			}
+			file.Decls = append(file.Decls, d)
+			return true
+		}
+	}
+
+	candidate := snippet
+	if !strings.Contains(strings.ToLower(candidate), "func ") {
+		candidate = "func AutoAdded() {\n\t" + candidate + "\n}"
+	}
+	parsed, err := parser.ParseFile(fset, "", "package dummy\n"+candidate, 0)
+	if err != nil {
+		return false
+	}
+	for _, d := range parsed.Decls {
+		if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.IMPORT {
+			continue
+		}
+		file.Decls = append(file.Decls, d)
+		return true
 	}
 	return false
 }
