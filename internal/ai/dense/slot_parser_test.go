@@ -36,3 +36,22 @@ func TestParsePromptWithSlots_FuzzyAndSynsets(t *testing.T) {
 		t.Fatalf("expected action 'INJECT_TAGS', got %q", res2.Action)
 	}
 }
+
+func TestParsePromptWithSlots_AbbreviatedFn(t *testing.T) {
+	graph := &dense.WorkspaceGraph{
+		Symbols: map[string]*dense.SymbolRef{
+			"ProcessOrder": {Name: "ProcessOrder", FilePath: "dense_generated.go"},
+		},
+	}
+
+	prompt := "please substitute fn ProcesOrdr for ProcessOrderV2() error { return nil }"
+	res := dense.ParsePromptWithSlots(prompt, graph)
+
+	if res.TargetSymbol != "ProcessOrder" {
+		t.Fatalf("Expected target symbol 'ProcessOrder', got: %s", res.TargetSymbol)
+	}
+
+	if res.PayloadCode != "ProcessOrderV2() error { return nil }" {
+		t.Fatalf("Expected payload 'ProcessOrderV2() error { return nil }', got: %q", res.PayloadCode)
+	}
+}

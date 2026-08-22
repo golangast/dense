@@ -30,24 +30,20 @@ func ParsePromptWithSlots(prompt string, graph *WorkspaceGraph) ParsedSlot {
 		return res
 	}
 
+	// 1. Resolve Action via verb synsets (swap/replace/substitute -> REPLACE)
 	tokens := strings.Fields(prompt)
-	for _, tok := range tokens {
-		clean := strings.ToLower(strings.TrimFunc(tok, isSymbolBoundary))
-		if clean == "" {
-			continue
-		}
-		if action, ok := slotVerbSynsets[clean]; ok {
-			res.Action = action
+	for _, t := range tokens {
+		clean := strings.ToLower(strings.TrimFunc(t, isSymbolBoundary))
+		if act, exists := slotVerbSynsets[clean]; exists {
+			res.Action = act
 			break
 		}
 	}
 
+	// 2. Resolve Target Symbol using Workspace Graph
 	if graph != nil {
-		for _, tok := range tokens {
-			clean := strings.TrimFunc(tok, isSymbolBoundary)
-			if clean == "" {
-				continue
-			}
+		for _, t := range tokens {
+			clean := strings.TrimFunc(t, isSymbolBoundary)
 			if _, exists := graph.Symbols[clean]; exists {
 				res.TargetSymbol = clean
 				break
@@ -58,13 +54,11 @@ func ParsePromptWithSlots(prompt string, graph *WorkspaceGraph) ParsedSlot {
 			}
 		}
 		if res.TargetSymbol == "" {
-			candidate := findFuzzySymbolMatch(tokens, graph)
-			if candidate != "" {
-				res.TargetSymbol = candidate
-			}
+			res.TargetSymbol = findFuzzySymbolMatch(tokens, graph)
 		}
 	}
 
+	// Fallback action detection for tag/json prompts
 	if res.Action == "" {
 		lower := strings.ToLower(prompt)
 		if strings.Contains(lower, "json") || strings.Contains(lower, "tag") || strings.Contains(lower, "annotate") {
@@ -72,13 +66,34 @@ func ParsePromptWithSlots(prompt string, graph *WorkspaceGraph) ParsedSlot {
 		}
 	}
 
-	if res.PayloadCode == "" {
-		payload := extractPayload(prompt)
-		if payload != "" {
-			res.PayloadCode = payload
+	// 3. Robust Code Payload Extraction (prefer character-indexing)
+	lower := strings.ToLower(prompt)
+
+	// Check for 'for' or 'with' boundary keywords (use last occurrence)
+	boundaryIdx := -1
+	for _, kw := range []string{" for ", " with "} {
+		if idx := strings.LastIndex(lower, kw); idx != -1 {
+			if boundaryIdx == -1 || idx > boundaryIdx {
+				boundaryIdx = idx + len(kw)
+			}
 		}
 	}
 
+	if boundaryIdx != -1 {
+		res.PayloadCode = strings.TrimSpace(prompt[boundaryIdx:])
+	} else if idx := strings.Index(lower, " fn "); idx != -1 {
+		res.PayloadCode = strings.TrimSpace(prompt[idx+len(" fn "):])
+	} else if idx := strings.Index(lower, " function "); idx != -1 {
+		res.PayloadCode = strings.TrimSpace(prompt[idx+len(" function "):])
+	} else if idx := strings.Index(prompt, "("); idx != -1 {
+		// Backtrack to identifier preceding '('
+		start := strings.LastIndexAny(prompt[:idx], " \t\n")
+		if start != -1 {
+			res.PayloadCode = strings.TrimSpace(prompt[start+1:])
+		}
+	}
+
+	// Post-process payload: strip target symbol if it prefixes the payload
 	if res.TargetSymbol != "" && res.PayloadCode != "" {
 		res.PayloadCode = stripTargetPrefix(res.PayloadCode, res.TargetSymbol)
 		res.PayloadCode = stripTargetPrefix(res.PayloadCode, strings.ToLower(res.TargetSymbol))
