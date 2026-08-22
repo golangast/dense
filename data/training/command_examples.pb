@@ -1087,3 +1087,31 @@ n
 code_updateEplease swap function oldHandler for newHandler() error { return nil }"code_update2code_update
 n
 code_updateEplease swap function oldHandler for newHandler() error { return nil }"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+>
+code_updateadd json tags to User"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+>
+code_updateadd json tags to User"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+>
+code_updateadd json tags to User"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+>
+code_updateadd json tags to User"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+>
+code_updateadd json tags to User"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+>
+code_updateadd json tags to User"code_update2code_update
+t
+code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update

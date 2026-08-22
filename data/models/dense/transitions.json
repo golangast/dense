@@ -1,6 +1,6 @@
 {
   "ADD_FUNC": {
-    "ADD_FUNC": 8,
+    "ADD_FUNC": 16,
     "ADD_UNIT_TEST": 8,
     "WRAP_ERRORS": 5
   },
@@ -13,6 +13,6 @@
   "ADD_STRUCT": {
     "ADD_CONSTRUCTOR": 6,
     "ADD_FUNC": 15,
-    "ADD_JSON_TAGS": 14
+    "ADD_JSON_TAGS": 20
   }
 }

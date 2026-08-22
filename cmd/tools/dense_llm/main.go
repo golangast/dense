@@ -630,6 +630,88 @@ func normalizeReplacementFunction(name, replacement string) string {
 	return "func " + name + " " + replacement
 }
 
+func extractFunctionNameFromCodeSnippet(code string) string {
+	trimmed := strings.TrimSpace(code)
+	trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "."))
+	trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "func "))
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.Index(trimmed, "("); idx > 0 {
+		name := strings.TrimSpace(trimmed[:idx])
+		if name != "" {
+			return name
+		}
+	}
+	if fields := strings.Fields(trimmed); len(fields) > 0 {
+		return strings.Trim(fields[0], " ")
+	}
+	return ""
+}
+
+func extractFunctionSignatureParts(code string) (string, []string, []string) {
+	trimmed := strings.TrimSpace(code)
+	trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "."))
+	trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "func "))
+	if trimmed == "" {
+		return "", nil, nil
+	}
+	leftParen := strings.Index(trimmed, "(")
+	if leftParen <= 0 {
+		return extractFunctionNameFromCodeSnippet(trimmed), nil, nil
+	}
+	name := strings.TrimSpace(trimmed[:leftParen])
+	if name == "" {
+		name = extractFunctionNameFromCodeSnippet(trimmed)
+	}
+	rest := trimmed[leftParen+1:]
+	closeParen := strings.Index(rest, ")")
+	params := []string{}
+	if closeParen >= 0 {
+		paramsStr := strings.TrimSpace(rest[:closeParen])
+		if paramsStr != "" {
+			for _, part := range strings.Split(paramsStr, ",") {
+				if s := strings.TrimSpace(part); s != "" {
+					params = append(params, s)
+				}
+			}
+		}
+		returnPart := strings.TrimSpace(rest[closeParen+1:])
+		if idx := strings.Index(returnPart, "{"); idx >= 0 {
+			returnPart = strings.TrimSpace(returnPart[:idx])
+		}
+		if returnPart != "" {
+			if strings.HasPrefix(returnPart, "(") {
+				inner := strings.TrimSpace(strings.Trim(returnPart, "()"))
+				if inner != "" {
+					for _, r := range strings.Split(inner, ",") {
+						if s := strings.TrimSpace(r); s != "" {
+							params = append(params[:0], params...)
+							break
+						}
+					}
+				}
+			}
+			if strings.HasPrefix(returnPart, "(") {
+				inner := strings.TrimSpace(strings.Trim(returnPart, "()"))
+				if inner != "" {
+					returns := []string{}
+					for _, r := range strings.Split(inner, ",") {
+						if s := strings.TrimSpace(r); s != "" {
+							returns = append(returns, s)
+						}
+					}
+					if len(returns) > 0 {
+						return name, params, returns
+					}
+				}
+			}
+			return name, params, []string{returnPart}
+		}
+	}
+	return name, params, nil
+}
+
 func functionSnippetFromPrompt(prompt string) string {
 	parsed := dense.ParseHybridPrompt(prompt)
 	if parsed.Action == "replace" {
@@ -1383,7 +1465,11 @@ func predictIntent(prompt string, conv *Conversation, model *dense.DenseModel, e
 	parsed := dense.ParseHybridPrompt(prompt)
 	if parsed.Action == "replace" {
 		if len(parsed.Identifiers) > 0 && parsed.RawCode != "" {
-			return Intent{Action: "ADD_FUNC", Name: parsed.Identifiers[0], Description: parsed.RawCode}
+			name, params, returns := extractFunctionSignatureParts(parsed.RawCode)
+			if name == "" {
+				name = parsed.Identifiers[0]
+			}
+			return Intent{Action: "ADD_FUNC", Name: name, Params: params, Returns: returns, Description: parsed.RawCode}
 		}
 	}
 	if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") {
@@ -2375,6 +2461,13 @@ func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.D
 		}
 	}
 
+	// Explicit structured intents must win over generic fallback heuristics.
+	if intent := predictIntent(prompt, conv, model, examples); intent.Action != "" {
+		if code, err := renderIntentToCode(intent); err == nil && code != "" {
+			return "🔧 " + code
+		}
+	}
+
 	// If the user asked to create a file but a target .go file is already set
 	// and exists, prefer an edit instead of a create.
 	if target != "" && strings.Contains(lower, "create file") && strings.HasSuffix(target, ".go") {
@@ -2402,15 +2495,19 @@ func buildContextAwareResponse(prompt string, conv *Conversation, model *dense.D
 	}
 
 	if cmdType == "code_update" {
+		if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") {
+			return "🔧 " + functionSnippetFromPrompt(prompt)
+		}
+		if strings.Contains(lower, "swap function") || strings.Contains(lower, "swap method") {
+			if snippet := functionSnippetFromPrompt(prompt); snippet != "" {
+				return "🔧 " + snippet
+			}
+		}
 		// Try to predict the intent first if it's an import or simple well-defined intent
 		if intent := predictIntent(prompt, conv, model, examples); intent.Action == "ADD_IMPORT" {
 			if code, err := renderIntentToCode(intent); err == nil && code != "" {
 				return "🔧 " + code
 			}
-		}
-		if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") {
-			// exact replacement is handled deterministically in the file-edit phase
-			return "🔧 " + functionSnippetFromPrompt(prompt)
 		}
 		if snippet := functionSnippetFromPrompt(prompt); snippet != "" {
 			return "🔧 " + snippet

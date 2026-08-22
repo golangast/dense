@@ -8,3 +8,6 @@ type GeneratedModel struct {
 func newHandler() error {
 	return nil
 }
+func ProcessOrderV2() error {
+	return nil
+}

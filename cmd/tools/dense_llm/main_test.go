@@ -415,6 +415,26 @@ func TestPredictIntent_JSONTagsPrecedence(t *testing.T) {
 	}
 }
 
+func TestBuildContextAwareResponse_JSONTagsDoesNotEchoPrompt(t *testing.T) {
+	resp := buildContextAwareResponse("add json tags to User", nil, nil, nil)
+	if !strings.Contains(resp, "type User struct") {
+		t.Fatalf("JSON-tag response should generate a User struct, got %q", resp)
+	}
+	if strings.Contains(resp, "json tags to User") {
+		t.Fatalf("JSON-tag response should not echo the raw prompt, got %q", resp)
+	}
+}
+
+func TestBuildContextAwareResponse_ReplacementDoesNotDuplicateOldName(t *testing.T) {
+	resp := buildContextAwareResponse("please swap function ProcessOrder for ProcessOrderV2() error { return nil }", nil, nil, nil)
+	if !strings.Contains(resp, "func ProcessOrderV2() error") {
+		t.Fatalf("replacement response should contain the new function signature, got %q", resp)
+	}
+	if strings.Contains(resp, "func ProcessOrder ProcessOrderV2") {
+		t.Fatalf("replacement response should not duplicate the old function name, got %q", resp)
+	}
+}
+
 func TestCrossPackageAutoImport(t *testing.T) {
 	const source = `package main`
 	fset := token.NewFileSet()
