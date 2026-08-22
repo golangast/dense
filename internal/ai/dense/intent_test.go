@@ -92,3 +92,16 @@ func TestColloquialSwapExtraction(t *testing.T) {
 		t.Fatalf("Expected raw code starting at 'sally', got: %q", parsed.RawCode)
 	}
 }
+
+func TestSignatureSwapExtraction(t *testing.T) {
+	prompt := `please swap function oldHandler for newHandler() error { return nil }`
+	parsed := dense.ParseHybridPrompt(prompt)
+
+	if len(parsed.Identifiers) != 1 || parsed.Identifiers[0] != "oldHandler" {
+		t.Fatalf("Expected identifier ['oldHandler'], got: %v", parsed.Identifiers)
+	}
+
+	if parsed.RawCode != "newHandler() error { return nil }" {
+		t.Fatalf("Expected raw code 'newHandler() error { return nil }', got: %q", parsed.RawCode)
+	}
+}
