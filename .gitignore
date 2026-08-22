@@ -12,4 +12,4 @@ bin/
 # Editor files
 .vscode/
 .idea/
-*.swp
+*.swp*.bak
