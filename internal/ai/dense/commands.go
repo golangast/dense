@@ -145,6 +145,11 @@ func ClassifyCommandType(prompt string) string {
 		(strings.Contains(lower, "remove") && (strings.Contains(lower, "folder") || strings.Contains(lower, "directory"))) {
 		return "folder_delete"
 	}
+	if (strings.Contains(lower, "replace ") || strings.Contains(lower, "substitute ") || strings.Contains(lower, "swap ") || strings.Contains(lower, "change ") || strings.Contains(lower, "update ")) &&
+		((strings.Contains(lower, " with ") || strings.Contains(lower, " for ") || strings.Contains(lower, " to ")) ||
+			(strings.Contains(lower, "function") || strings.Contains(lower, "fn ") || strings.Contains(lower, " method ") || strings.Contains(lower, "func "))) {
+		return "code_update"
+	}
 	if strings.Contains(lower, "replace ") && strings.Contains(lower, " with ") ||
 		strings.Contains(lower, "rename ") && strings.Contains(lower, " to ") ||
 		strings.Contains(lower, "create function") || strings.Contains(lower, "create struct") ||

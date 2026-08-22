@@ -176,6 +176,45 @@ func RouteAndExecuteWorkspaceWithSlot(graph *WorkspaceGraph, targetFile string, 
 	return actualFile, false
 }
 
+// RouteAndExecuteWorkspaceWithCodeAwareSlot handles CodeAwareSlot specifically,
+// allowing explicit file targets and ADD_FUNC actions.
+func RouteAndExecuteWorkspaceWithCodeAwareSlot(graph *WorkspaceGraph, targetFile string, slot CodeAwareSlot) (string, bool) {
+	if graph == nil {
+		return "", false
+	}
+
+	actualFile := targetFile
+	if actualFile == "" {
+		if slot.ExplicitFile != "" {
+			actualFile = slot.ExplicitFile
+		} else if slot.TargetSymbol != "" {
+			if sym, found := graph.Symbols[slot.TargetSymbol]; found {
+				actualFile = sym.FilePath
+			}
+		}
+	}
+
+	if actualFile == "" {
+		return "", false
+	}
+
+	fileAST, exists := graph.Files[actualFile]
+	if !exists {
+		return actualFile, false
+	}
+
+	switch slot.Action {
+	case "ADD_FUNC":
+		return actualFile, AppendFunctionDecl(fileAST, slot.PayloadCode)
+	case "REPLACE":
+		return actualFile, ReplaceFunctionDecl(fileAST, slot.TargetSymbol, slot.PayloadCode)
+	case "INJECT_TAGS":
+		return actualFile, AutoInjectJSONTags(fileAST, slot.TargetSymbol)
+	}
+
+	return actualFile, false
+}
+
 func RouteAndExecuteNLP(graph *WorkspaceGraph, targetFile string, prompt string) (string, bool) {
 	if graph == nil {
 		return "", false

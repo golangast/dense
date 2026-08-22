@@ -53,3 +53,5 @@ llm: build-dense_llm
 train: build-dense_train
 	./$(DENSE_TRAIN)
 
+all: build ./$(DENSE_LLM) ./$(DENSE_TRAIN) & rm -rf $(BIN_DIR)
+	

@@ -736,6 +736,33 @@ func functionSnippetFromPrompt(prompt string) string {
 		}
 	}
 	lower := strings.ToLower(strings.TrimSpace(prompt))
+	for _, verb := range []string{"replace ", "substitute ", "swap ", "change ", "update "} {
+		if idx := strings.Index(lower, verb); idx >= 0 {
+			tail := strings.TrimSpace(prompt[idx+len(verb):])
+			if strings.HasPrefix(strings.ToLower(tail), "function ") {
+				tail = strings.TrimSpace(tail[len("function "):])
+			}
+			if strings.HasPrefix(strings.ToLower(tail), "fn ") {
+				tail = strings.TrimSpace(tail[len("fn "):])
+			}
+			if strings.HasPrefix(strings.ToLower(tail), "method ") {
+				tail = strings.TrimSpace(tail[len("method "):])
+			}
+			for _, keyword := range []string{" for ", " with ", " to "} {
+				if j := strings.Index(strings.ToLower(tail), keyword); j >= 0 {
+					body := strings.TrimSpace(tail[j+len(keyword):])
+					body = strings.TrimSpace(strings.TrimSuffix(body, "."))
+					body = regexp.MustCompile("(?i)\\s+(?:in\\s+)?(?:file\\s+)?[A-Za-z0-9_./\\\\-]+\\.go\\s*$").ReplaceAllString(body, "")
+					if strings.HasPrefix(strings.ToLower(body), "func ") {
+						return body + "\n"
+					}
+					if strings.Contains(body, "(") || strings.Contains(body, "{") {
+						return normalizeReplacementFunction("", body) + "\n"
+					}
+				}
+			}
+		}
+	}
 	if idx := strings.Index(lower, "replace "); idx >= 0 {
 		nameEnd := strings.Index(strings.TrimSpace(prompt[idx+len("replace "):]), " with ")
 		if nameEnd >= 0 {
@@ -3754,11 +3781,11 @@ func main() {
 			fset := token.NewFileSet()
 			fileAST, parseErr := parser.ParseFile(fset, resolvedFile, nil, parser.ParseComments)
 			if parseErr == nil {
-				slot := dense.ParsePromptWithSlots(*oneShot, wgraph)
-				if slot.TargetSymbol == "" {
+				slot := dense.ParseCodeAwarePrompt(*oneShot, wgraph)
+				if slot.TargetSymbol == "" && slot.Action != "ADD_FUNC" {
 					log.Fatalf("Error: Could not resolve target symbol from prompt: %q", *oneShot)
 				}
-				if targetFile, success := dense.RouteAndExecuteWorkspaceWithSlot(wgraph, resolvedFile, slot); success {
+				if targetFile, success := dense.RouteAndExecuteWorkspaceWithCodeAwareSlot(wgraph, resolvedFile, slot); success {
 					if targetFile != "" {
 						f, createErr := os.Create(targetFile)
 						if createErr == nil {

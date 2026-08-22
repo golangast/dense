@@ -289,3 +289,26 @@ func init() {
 	_ = format.Node
 	_ = parser.ParseFile
 }
+
+// AppendFunctionDecl parses a raw function snippet and appends it to the file AST.
+func AppendFunctionDecl(file *ast.File, rawSnippet string) bool {
+	if file == nil || strings.TrimSpace(rawSnippet) == "" {
+		return false
+	}
+	fset := token.NewFileSet()
+	// Parse as a small file with package and function(s)
+	snippet := "package dummy\nfunc " + rawSnippet
+	parsed, err := parser.ParseFile(fset, "", snippet, 0)
+	if err != nil || len(parsed.Decls) == 0 {
+		return false
+	}
+
+	// Find the first FuncDecl and append it
+	for _, d := range parsed.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok {
+			file.Decls = append(file.Decls, fd)
+			return true
+		}
+	}
+	return false
+}

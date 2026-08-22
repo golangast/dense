@@ -1,4 +1,4 @@
-package main
+package to
 
 type MyStruct struct {
 	FirstName string `json:"first_name"`

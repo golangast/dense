@@ -1,4 +1,4 @@
-package main
+package dense
 
 type GeneratedModel struct {
 	FirstName string
@@ -8,6 +8,7 @@ type GeneratedModel struct {
 func newHandler() error {
 	return nil
 }
+
 func ProcessOrderV2() error {
 	return nil
 }

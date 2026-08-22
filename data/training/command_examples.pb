@@ -1115,3 +1115,45 @@ t
 code_updateadd json tags to User"code_update2code_update
 t
 code_updateKplease swap function ProcessOrder for ProcessOrderV2() error { return nil }"code_update2code_update
+x
+code_updateOplease substitute function ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+x
+code_updateOplease substitute function ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+x
+code_updateOplease substitute function ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+x
+code_updateOplease substitute function ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+x
+code_updateOplease substitute function ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+x
+code_updateOplease substitute function ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+x
+code_updateOplease substitute function ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+L
+code_update#annotate struct User with json tags"code_update2code_update
+r
+code_updateIplease substitute fn ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+L
+code_update#annotate struct User with json tags"code_update2code_update
+L
+code_update#annotate struct User with json tags"code_update2code_update
+r
+code_updateIplease substitute fn ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+L
+code_update#annotate struct User with json tags"code_update2code_update
+L
+code_update#annotate struct User with json tags"code_update2code_update
+m
+code_updateDgolangast-dense -dir=. -prompt="annotate struct User with json tags""code_update2code_update
+L
+code_update#annotate struct User with json tags"code_update2code_update
+r
+code_updateIplease substitute fn ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+r
+code_updateIplease substitute fn ProcesOrdr for ProcessOrderV2() error { return nil }"code_update2code_update
+N
+code_update%add function jimmy to file jim/jim.go"code_update2code_update
+M
+code_update$in file jim/jim.go add function jane"code_update2code_update
+N
+code_update%add function jimmy to file jim/jim.go"code_update2code_update
