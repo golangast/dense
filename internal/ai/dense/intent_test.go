@@ -79,3 +79,16 @@ func Hello() int {
 		t.Fatalf("decl name = %q, want %q", got, "World")
 	}
 }
+
+func TestColloquialSwapExtraction(t *testing.T) {
+	prompt := "please swap function jim for sally() int { return 10 }"
+	parsed := dense.ParseHybridPrompt(prompt)
+
+	if len(parsed.Identifiers) == 0 || parsed.Identifiers[0] != "jim" {
+		t.Fatalf("Expected identifier 'jim', got: %v", parsed.Identifiers)
+	}
+
+	if parsed.RawCode != "sally() int { return 10 }" {
+		t.Fatalf("Expected raw code starting at 'sally', got: %q", parsed.RawCode)
+	}
+}
