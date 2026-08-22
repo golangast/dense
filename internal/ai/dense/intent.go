@@ -9,6 +9,11 @@ import (
 	"strings"
 )
 
+var stopWords = map[string]bool{
+	"please": true, "swap": true, "replace": true, "function": true,
+	"fn": true, "method": true, "for": true, "with": true, "to": true,
+}
+
 type ParsedPrompt struct {
 	Action      string
 	Identifiers []string
@@ -40,37 +45,20 @@ func ParseHybridPrompt(prompt string) ParsedPrompt {
 
 	for i, t := range tokens {
 		lower := strings.ToLower(t)
-		if lower == "replace" || lower == "add" || lower == "wrap" {
-			res.Action = lower
-			// Don't pick next token yet — we look for "to"/"in"/"with" below.
+		if lower == "replace" || lower == "swap" || lower == "change" {
+			res.Action = "replace"
 		}
-		if lower == "with" {
-			if res.Action != "" && len(res.Identifiers) == 0 && i > 0 {
-				prev := tokens[i-1]
-				if prev != "to" && prev != "in" && prev != "with" && !strings.EqualFold(prev, "replace") && !strings.EqualFold(prev, "add") && !strings.EqualFold(prev, "wrap") {
-					res.Identifiers = append(res.Identifiers, prev)
-				}
-			}
-			if i+1 < len(positions) {
-				codeStart := positions[i+1] - 1
-				res.RawCode = strings.TrimSpace(prompt[codeStart:])
-				break
+
+		if res.Action != "" && len(res.Identifiers) == 0 {
+			if !stopWords[lower] && token.IsIdentifier(t) {
+				res.Identifiers = append(res.Identifiers, t)
 			}
 		}
-		// "add ... to <Target>" and "wrap ... in <Target>"
-		if (lower == "to" || lower == "in") && res.Action != "" && res.Action != "replace" {
-			if i+1 < len(tokens) {
-				res.Identifiers = append(res.Identifiers, tokens[i+1])
-			}
-		}
-	}
-	// Fallback: if no target was captured via "to"/"in", use the token right after the verb.
-	if len(res.Identifiers) == 0 && res.Action != "" {
-		for i, t := range tokens {
-			if strings.ToLower(t) == res.Action && i+1 < len(tokens) {
-				res.Identifiers = append(res.Identifiers, tokens[i+1])
-				break
-			}
+
+		if (lower == "with" || lower == "for") && i+1 < len(positions) {
+			codeStart := positions[i+1] - 1
+			res.RawCode = strings.TrimSpace(prompt[codeStart:])
+			break
 		}
 	}
 
@@ -154,4 +142,47 @@ func RouteAndExecuteWorkspace(graph *WorkspaceGraph, targetFile string, prompt s
 
 	success := RouteAndExecute(fileAST, prompt)
 	return actualFile, success
+}
+
+func RouteAndExecuteNLP(graph *WorkspaceGraph, targetFile string, prompt string) (string, bool) {
+	if graph == nil {
+		return "", false
+	}
+
+	predictedIntent, confidence := PredictIntentNLP(prompt)
+	if confidence < 0.20 {
+		return RouteAndExecuteWorkspace(graph, targetFile, prompt)
+	}
+
+	parsed := ParseHybridPrompt(prompt)
+	actualFile := targetFile
+	if actualFile == "" && len(parsed.Identifiers) > 0 {
+		for _, ident := range parsed.Identifiers {
+			if sym, found := graph.FindSymbol(ident); found {
+				actualFile = sym.FilePath
+				break
+			}
+		}
+	}
+	if actualFile == "" {
+		return "", false
+	}
+
+	fileAST, ok := graph.Files[actualFile]
+	if !ok {
+		return actualFile, false
+	}
+
+	switch predictedIntent {
+	case IntentReplaceFunc:
+		if len(parsed.Identifiers) > 0 && parsed.RawCode != "" {
+			return actualFile, ReplaceFunctionDecl(fileAST, parsed.Identifiers[0], parsed.RawCode)
+		}
+	case IntentAddTags:
+		if len(parsed.Identifiers) > 0 {
+			return actualFile, AutoInjectJSONTags(fileAST, parsed.Identifiers[0])
+		}
+	}
+
+	return actualFile, false
 }
