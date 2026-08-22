@@ -49,16 +49,22 @@ func ParseHybridPrompt(prompt string) ParsedPrompt {
 			res.Action = "replace"
 		}
 
-		if res.Action != "" && len(res.Identifiers) == 0 {
-			if !stopWords[lower] && token.IsIdentifier(t) {
-				res.Identifiers = append(res.Identifiers, t)
-			}
-		}
-
 		if (lower == "with" || lower == "for") && i+1 < len(positions) {
 			codeStart := positions[i+1] - 1
 			res.RawCode = strings.TrimSpace(prompt[codeStart:])
 			break
+		}
+
+		if t == "(" && i > 0 {
+			codeStart := positions[i-1] - 1
+			res.RawCode = strings.TrimSpace(prompt[codeStart:])
+			break
+		}
+
+		if res.Action != "" && len(res.Identifiers) == 0 {
+			if !stopWords[lower] && token.IsIdentifier(t) {
+				res.Identifiers = append(res.Identifiers, t)
+			}
 		}
 	}
 
