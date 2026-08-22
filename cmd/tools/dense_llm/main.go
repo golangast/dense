@@ -3751,15 +3751,24 @@ func main() {
 			}
 		}
 
-		// If no -file flag, resolve the target via the semantic slot parser.
+		// If no -file flag, resolve the target via the code-aware slot parser.
 		if resolvedFile == "" {
-			slot := dense.ParsePromptWithSlots(*oneShot, wgraph)
-			if slot.TargetSymbol == "" {
+			slot := dense.ParseCodeAwarePrompt(*oneShot, wgraph)
+			if slot.TargetSymbol == "" && slot.ExplicitFile == "" {
 				log.Printf("Could not resolve target symbol from prompt: %q", *oneShot)
 			} else {
-				if wgraph != nil {
+				if wgraph != nil && slot.TargetSymbol != "" {
 					if sym, ok := wgraph.FindSymbol(slot.TargetSymbol); ok {
 						resolvedFile = sym.FilePath
+					}
+				}
+				if resolvedFile == "" && slot.ExplicitFile != "" {
+					// match suffixes against indexed file paths
+					for fp := range wgraph.Files {
+						if strings.HasSuffix(fp, slot.ExplicitFile) {
+							resolvedFile = fp
+							break
+						}
 					}
 				}
 				if resolvedFile == "" && wsCache != nil {
@@ -3782,15 +3791,20 @@ func main() {
 			fileAST, parseErr := parser.ParseFile(fset, resolvedFile, nil, parser.ParseComments)
 			if parseErr == nil {
 				slot := dense.ParseCodeAwarePrompt(*oneShot, wgraph)
-				if slot.TargetSymbol == "" && slot.Action != "ADD_FUNC" {
-					log.Fatalf("Error: Could not resolve target symbol from prompt: %q", *oneShot)
+				if slot.TargetSymbol == "" && slot.ExplicitFile == "" && slot.Action != "ADD_FUNC" {
+					log.Fatalf("Error: Could not resolve target symbol or file from prompt: %q", *oneShot)
 				}
 				if targetFile, success := dense.RouteAndExecuteWorkspaceWithCodeAwareSlot(wgraph, resolvedFile, slot); success {
 					if targetFile != "" {
 						f, createErr := os.Create(targetFile)
 						if createErr == nil {
 							defer f.Close()
-							_ = format.Node(f, fset, fileAST)
+							// Write the possibly-mutated AST from the workspace index (if present)
+							if astFromIndex, ok := wgraph.Files[targetFile]; ok {
+								_ = format.Node(f, fset, astFromIndex)
+							} else {
+								_ = format.Node(f, fset, fileAST)
+							}
 							fmt.Printf("Successfully updated %s\n", targetFile)
 							os.Exit(0)
 						}

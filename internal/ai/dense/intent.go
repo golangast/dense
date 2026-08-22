@@ -184,13 +184,21 @@ func RouteAndExecuteWorkspaceWithCodeAwareSlot(graph *WorkspaceGraph, targetFile
 	}
 
 	actualFile := targetFile
-	if actualFile == "" {
-		if slot.ExplicitFile != "" {
-			actualFile = slot.ExplicitFile
-		} else if slot.TargetSymbol != "" {
-			if sym, found := graph.Symbols[slot.TargetSymbol]; found {
-				actualFile = sym.FilePath
+
+	// 1. Resolve Explicit File Path by matching suffixes (handles relative CLI paths)
+	if actualFile == "" && slot.ExplicitFile != "" {
+		for filePath := range graph.Files {
+			if strings.HasSuffix(filePath, slot.ExplicitFile) {
+				actualFile = filePath
+				break
 			}
+		}
+	}
+
+	// 2. Resolve via Workspace Symbol Graph if still empty
+	if actualFile == "" && slot.TargetSymbol != "" {
+		if sym, found := graph.Symbols[slot.TargetSymbol]; found {
+			actualFile = sym.FilePath
 		}
 	}
 

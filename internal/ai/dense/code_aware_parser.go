@@ -11,7 +11,11 @@ import (
 	"strings"
 )
 
-var receiverRegex = regexp.MustCompile(`\(([^)]+)\)`)
+var (
+	receiverRegex   = regexp.MustCompile(`\(([^)]+)\)`)
+	fileClauseRegex = regexp.MustCompile(`(?i)\b(?:in|to|from|for)\s+(?:file\s+)?([a-zA-Z0-9_\-/\.]+\.go)\b`)
+	addFuncRegex    = regexp.MustCompile(`(?i)\b(?:add|create|make)\s+(?:func|function)\s+([a-zA-Z0-9_]+)\b`)
+)
 
 type CodeAwareSlot struct {
 	ParsedSlot
@@ -46,19 +50,18 @@ func ParseCodeAwarePrompt(prompt string, graph *WorkspaceGraph) CodeAwareSlot {
 		return slot
 	}
 
-	// 1. Extract explicit file target like "to file jim/jim.go" or "in file.go"
-	fileTargetRegex := regexp.MustCompile(`(?i)(?:in|to|from)\s+(?:file\s+)?([a-zA-Z0-9_\-/\.]+\.go)`)
-	if m := fileTargetRegex.FindStringSubmatch(prompt); len(m) > 1 {
+	// 1. Extract and strip explicit file target first (normalize to clean path)
+	if m := fileClauseRegex.FindStringSubmatch(prompt); len(m) > 1 {
 		slot.ExplicitFile = filepath.Clean(m[1])
-		prompt = fileTargetRegex.ReplaceAllString(prompt, "")
+		prompt = fileClauseRegex.ReplaceAllString(prompt, "")
 	}
 
-	// 1b. Extract add-function intent like "add function jimmy"
-	funcDeclRegex := regexp.MustCompile(`(?i)(?:add|create|make)\s+(?:func|function)\s+([a-zA-Z0-9_]+)`)
-	if m := funcDeclRegex.FindStringSubmatch(prompt); len(m) > 1 {
+	// 2. Extract add-function intent on the cleaned prompt
+	if m := addFuncRegex.FindStringSubmatch(prompt); len(m) > 1 {
+		funcName := strings.Title(m[1])
 		slot.Action = "ADD_FUNC"
-		slot.FunctionName = strings.Title(m[1])
-		slot.PayloadCode = slot.FunctionName + "() {\n\treturn\n}"
+		slot.TargetSymbol = funcName
+		slot.PayloadCode = funcName + "() {\n\treturn\n}"
 		return slot
 	}
 
