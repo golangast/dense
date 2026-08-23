@@ -1,11 +1,13 @@
 package dense
 
+import "context"
+
 type GeneratedModel struct {
 	FirstName string
 	LastName  string
 }
 
-func newHandler() error {
+func newHandler(ctx context.Context,) error {
 	return nil
 }
 

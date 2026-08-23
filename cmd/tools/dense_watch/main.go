@@ -22,6 +22,7 @@ import (
 
 	"github.com/golangast/dense/internal/ai/dense"
 	"github.com/golangast/dense/internal/generator"
+	"github.com/golangast/dense/internal/tools/oncefix"
 )
 
 var globalAutoApply bool
@@ -230,8 +231,13 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ch:
-				// run suggestion pass
-				runSuggestions(abs)
+				// run one-shot fixer instead of interactive suggestion pass
+				if report, err := oncefix.RunOnce(abs, globalAutoApply, globalAutoRestoreGit); err != nil {
+					fmt.Print(report)
+					fmt.Printf("one-shot fixer error: %v\n", err)
+				} else {
+					fmt.Print(report)
+				}
 				// reset channel so we don't re-enter until next event
 				ch = nil
 			}
@@ -241,291 +247,345 @@ func main() {
 	<-done
 }
 
-func runSuggestions(dir string) {
-	fmt.Println("=== dense: running suggestion pass ===")
-	// 1. diagnose project errors
-	diags, derr := generator.DiagnoseProject(dir)
-	if derr != nil {
-		fmt.Printf("diagnose error: %v\n", derr)
-	}
-	options := []string{}
-	// diagnostics -> offer auto-fix options
-	if len(diags) == 0 {
-		fmt.Println("No compiler diagnostics found.")
-	} else {
-		fmt.Printf("Found %d diagnostics:\n", len(diags))
-		for i, d := range diags {
-			fmt.Printf("- %s:%d:%d %s\n", d.FilePath, d.Line, d.Column, d.Message)
-			options = append(options, fmt.Sprintf("Auto-fix diagnostic %d: %s", i+1, d.Message))
+func runSuggestions(dir string, timeout time.Duration) {
+	// runSuggestions performs the suggestion pass in a goroutine and respects a
+	// caller-provided timeout. A timeout of 0 means run to completion.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fmt.Println("=== dense: running suggestion pass ===")
+		// 1. diagnose project errors
+		diags, derr := generator.DiagnoseProject(dir)
+		if derr != nil {
+			fmt.Printf("diagnose error: %v\n", derr)
 		}
-	}
+		for i := range diags {
+			if !filepath.IsAbs(diags[i].FilePath) {
+				diags[i].FilePath = filepath.Join(dir, diags[i].FilePath)
+			}
+		}
+		options := []string{}
+		// diagnostics -> offer auto-fix options
+		if len(diags) == 0 {
+			fmt.Println("No compiler diagnostics found.")
+		} else {
+			fmt.Printf("Found %d diagnostics:\n", len(diags))
+			for i, d := range diags {
+				fmt.Printf("- %s:%d:%d %s\n", d.FilePath, d.Line, d.Column, d.Message)
+				options = append(options, fmt.Sprintf("Auto-fix diagnostic %d: %s", i+1, d.Message))
+			}
+		}
 
-	// 2. index workspace and offer proactive suggestions
-	wgraph, err := dense.IndexWorkspace(dir)
-	if err != nil {
-		fmt.Printf("workspace index error: %v\n", err)
-		return
-	}
+		// 2. index workspace and offer proactive suggestions
+		wgraph, err := dense.IndexWorkspace(dir)
+		if err != nil {
+			fmt.Printf("workspace index error: %v\n", err)
+			return
+		}
 
-	// simple heuristics: suggest adding context param to funcs with 'context' in name
-	type opt struct {
-		kind   string // "diag" or "add_context"
-		index  int    // diag index
-		file   string
-		symbol string
-	}
-	opts := []opt{}
-	for fp, f := range wgraph.Files {
-		for _, decl := range f.Decls {
-			if fn, ok := decl.(*ast.FuncDecl); ok {
-				name := fn.Name.Name
-				lname := strings.ToLower(name)
-				if (strings.Contains(lname, "handler") || strings.Contains(lname, "serve") || strings.Contains(lname, "start")) && !hasContextParam(fn) {
-					desc := fmt.Sprintf("Inject context.Context into %s (file: %s)", name, fp)
-					fmt.Println("- ", desc)
-					opts = append(opts, opt{kind: "add_context", file: fp, symbol: name})
-					options = append(options, desc)
+		// simple heuristics: suggest adding context param to funcs with 'context' in name
+		type opt struct {
+			kind   string // "diag" or "add_context"
+			index  int    // diag index
+			file   string
+			symbol string
+		}
+		opts := []opt{}
+		for fp, f := range wgraph.Files {
+			for _, decl := range f.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok {
+					name := fn.Name.Name
+					lname := strings.ToLower(name)
+					if (strings.Contains(lname, "handler") || strings.Contains(lname, "serve") || strings.Contains(lname, "start")) && !hasContextParam(fn) {
+						desc := fmt.Sprintf("Inject context.Context into %s (file: %s)", name, fp)
+						fmt.Println("- ", desc)
+						opts = append(opts, opt{kind: "add_context", file: fp, symbol: name})
+						options = append(options, desc)
+					}
 				}
 			}
 		}
-	}
 
-	// If we have actionable options, prompt the user to choose one.
-	if len(options) == 0 {
-		fmt.Println("=== dense: suggestion pass complete ===")
-		return
-	}
-
-	fmt.Println("\nChoose an option to apply (comma-separated numbers), or press Enter to skip:")
-	for i, o := range options {
-		fmt.Printf("%d) %s\n", i+1, o)
-	}
-	// If auto-apply is enabled, automatically choose all diagnostics.
-	reader := bufio.NewReader(os.Stdin)
-	var picks []string
-	line := ""
-	if globalAutoApply && len(diags) > 0 {
-		// choose diagnostics only (they are the first options)
-		for i := 1; i <= len(diags); i++ {
-			picks = append(picks, strconv.Itoa(i))
-		}
-		fmt.Printf("Auto-apply enabled: selecting diagnostics %s\n", strings.Join(picks, ","))
-	} else {
-		fmt.Print("Select (prefix with 'p' to preview, e.g. p1,2): ")
-		line, _ = reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-		if line == "" {
-			fmt.Println("No selection; skipping.")
+		// If we have actionable options, prompt the user to choose one.
+		if len(options) == 0 {
 			fmt.Println("=== dense: suggestion pass complete ===")
 			return
 		}
-		picks = strings.Split(line, ",")
-	}
 
-	// if user requested preview (input starts with 'p')
-	previewMode := false
-	if strings.HasPrefix(strings.ToLower(line), "p") {
-		previewMode = true
-		// strip leading p from each pick token
-		for i := range picks {
-			picks[i] = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(picks[i]), "p"))
+		fmt.Println("\nChoose an option to apply (comma-separated numbers), or press Enter to skip:")
+		for i, o := range options {
+			fmt.Printf("%d) %s\n", i+1, o)
 		}
-	}
+		// If auto-apply is enabled, automatically choose all diagnostics.
+		reader := bufio.NewReader(os.Stdin)
+		var picks []string
+		line := ""
+		if globalAutoApply && len(diags) > 0 {
+			// choose diagnostics only (they are the first options)
+			for i := 1; i <= len(diags); i++ {
+				picks = append(picks, strconv.Itoa(i))
+			}
+			fmt.Printf("Auto-apply enabled: selecting diagnostics %s\n", strings.Join(picks, ","))
+		} else {
+			fmt.Print("Select (prefix with 'p' to preview, e.g. p1,2): ")
+			line, _ = reader.ReadString('\n')
+			line = strings.TrimSpace(line)
+			if line == "" {
+				fmt.Println("No selection; skipping.")
+				fmt.Println("=== dense: suggestion pass complete ===")
+				return
+			}
+			picks = strings.Split(line, ",")
+		}
 
-	// transactionally apply all chosen fixes with backups and a verification step
-	backups := map[string][]byte{}
-	modified := map[string]bool{}
-	appliedAny := false
-	for _, p := range picks {
-		p = strings.TrimSpace(p)
-		idx, err := strconv.Atoi(p)
-		if err != nil || idx < 1 || idx > len(options) {
-			fmt.Printf("invalid choice: %s\n", p)
-			continue
+		// if user requested preview (input starts with 'p')
+		previewMode := false
+		if strings.HasPrefix(strings.ToLower(line), "p") {
+			previewMode = true
+			// strip leading p from each pick token
+			for i := range picks {
+				picks[i] = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(picks[i]), "p"))
+			}
 		}
-		chosen := idx - 1
-		// preview mode: show diffs for each chosen and continue
-		if previewMode {
-			if chosen < len(diags) {
-				// diagnostic preview
-				d := diags[chosen]
-				if b, err := previewAutoFix(d); err == nil {
-					showDiff(d.FilePath, b)
-					// If auto-apply is enabled, do not prompt; otherwise ask the user.
-					applyNow := false
-					if globalAutoApply {
-						applyNow = true
-					} else {
-						fmt.Print("Apply this preview? (y/N): ")
-						yn, _ := reader.ReadString('\n')
-						yn = strings.TrimSpace(strings.ToLower(yn))
-						if yn == "y" || yn == "yes" {
+
+		// transactionally apply all chosen fixes with backups and a verification step
+		backups := map[string][]byte{}
+		modified := map[string]bool{}
+		appliedAny := false
+		for _, p := range picks {
+			p = strings.TrimSpace(p)
+			idx, err := strconv.Atoi(p)
+			if err != nil || idx < 1 || idx > len(options) {
+				fmt.Printf("invalid choice: %s\n", p)
+				continue
+			}
+			chosen := idx - 1
+			// preview mode: show diffs for each chosen and continue
+			if previewMode {
+				if chosen < len(diags) {
+					// diagnostic preview
+					d := diags[chosen]
+					if b, err := previewAutoFix(d); err == nil {
+						showDiff(d.FilePath, b)
+						// If auto-apply is enabled, do not prompt; otherwise ask the user.
+						applyNow := false
+						if globalAutoApply {
 							applyNow = true
-						}
-					}
-					if applyNow {
-						// perform same apply steps as normal flow for this diagnostic
-						if _, ok := backups[d.FilePath]; !ok {
-							if bb, err := os.ReadFile(d.FilePath); err == nil {
-								backups[d.FilePath] = bb
-							} else {
-								backups[d.FilePath] = nil
+						} else {
+							fmt.Print("Apply this preview? (y/N): ")
+							yn, _ := reader.ReadString('\n')
+							yn = strings.TrimSpace(strings.ToLower(yn))
+							if yn == "y" || yn == "yes" {
+								applyNow = true
 							}
 						}
-						fmt.Printf("Applying auto-fix to %s...\n", d.FilePath)
-						if generator.AutoFixFile(d) {
-							modified[d.FilePath] = true
-							appliedAny = true
-							fmt.Printf("Auto-fix applied to %s\n", d.FilePath)
-						} else {
-							fmt.Printf("Auto-fix failed for %s\n", d.FilePath)
-						}
-					}
-				} else {
-					fmt.Printf("preview failed for %s: %v\n", d.FilePath, err)
-				}
-			} else {
-				optIdx := chosen - len(diags)
-				if optIdx >= 0 && optIdx < len(opts) {
-					o := opts[optIdx]
-					if o.kind == "add_context" {
-						if b, err := previewAddContext(o.file, o.symbol, dir); err == nil {
-							showDiff(o.file, b)
-						} else {
-							fmt.Printf("preview failed for %s: %v\n", o.file, err)
-						}
-					}
-				}
-			}
-			continue
-		}
-		// diagnostic choices
-		if chosen < len(diags) {
-			d := diags[chosen]
-			target := d.FilePath
-			if _, ok := backups[target]; !ok {
-				if b, err := os.ReadFile(target); err == nil {
-					backups[target] = b
-				} else {
-					backups[target] = nil
-				}
-			}
-			fmt.Printf("Applying auto-fix to %s...\n", target)
-			if generator.AutoFixFile(d) {
-				modified[target] = true
-				appliedAny = true
-				fmt.Printf("Auto-fix applied to %s\n", target)
-			} else {
-				// If the generic fixer failed, and this looks like a missing '{'
-				// after a `type X struct` line, try a conservative inline edit
-				// (insert '{' at end of previous line). This is safe and can be
-				// rolled back by restoring backups on verification failure.
-				if globalAutoApply && strings.Contains(d.Message, "expected {") {
-					data, rerr := os.ReadFile(target)
-					if rerr == nil {
-						lines := strings.Split(string(data), "\n")
-						ln := d.Line - 1
-						prev := ln - 1
-						if prev >= 0 && prev < len(lines) {
-							trim := strings.TrimSpace(lines[prev])
-							if strings.HasPrefix(trim, "type ") && strings.Contains(trim, "struct") && !strings.Contains(lines[prev], "{") {
-								lines[prev] = lines[prev] + " {"
-								_ = os.WriteFile(target, []byte(strings.Join(lines, "\n")), 0644)
-								modified[target] = true
+						if applyNow {
+							// perform same apply steps as normal flow for this diagnostic
+							if _, ok := backups[d.FilePath]; !ok {
+								if bb, err := os.ReadFile(d.FilePath); err == nil {
+									backups[d.FilePath] = bb
+								} else {
+									backups[d.FilePath] = nil
+								}
+							}
+							fmt.Printf("Applying auto-fix to %s...\n", d.FilePath)
+							if generator.AutoFixFile(d) {
+								modified[d.FilePath] = true
 								appliedAny = true
-								fmt.Printf("Conservative inline edit applied to %s\n", target)
-								goto applied_diag
+								fmt.Printf("Auto-fix applied to %s\n", d.FilePath)
+							} else {
+								fmt.Printf("Auto-fix failed for %s\n", d.FilePath)
+							}
+						}
+					} else {
+						fmt.Printf("preview failed for %s: %v\n", d.FilePath, err)
+					}
+				} else {
+					optIdx := chosen - len(diags)
+					if optIdx >= 0 && optIdx < len(opts) {
+						o := opts[optIdx]
+						if o.kind == "add_context" {
+							if b, err := previewAddContext(o.file, o.symbol, dir); err == nil {
+								showDiff(o.file, b)
+							} else {
+								fmt.Printf("preview failed for %s: %v\n", o.file, err)
 							}
 						}
 					}
 				}
-				fmt.Printf("Auto-fix failed for %s\n", target)
+				continue
 			}
-		applied_diag:
-			continue
-		}
-
-		// otherwise choose from heuristic opts
-		optIdx := chosen - len(diags)
-		if optIdx >= 0 && optIdx < len(opts) {
-			o := opts[optIdx]
-			if o.kind == "add_context" {
-				targetFile := o.file
-				if _, ok := backups[targetFile]; !ok {
-					if b, err := os.ReadFile(targetFile); err == nil {
-						backups[targetFile] = b
+			// diagnostic choices
+			if chosen < len(diags) {
+				d := diags[chosen]
+				target := d.FilePath
+				if _, ok := backups[target]; !ok {
+					if b, err := os.ReadFile(target); err == nil {
+						backups[target] = b
 					} else {
-						backups[targetFile] = nil
+						backups[target] = nil
 					}
 				}
-				fmt.Printf("Injecting context param into %s in %s...\n", o.symbol, targetFile)
-				wgraph2, err := dense.IndexWorkspace(dir)
-				if err != nil {
-					fmt.Printf("failed to index workspace: %v\n", err)
-					continue
+				fmt.Printf("Applying auto-fix to %s...\n", target)
+				if generator.AutoFixFile(d) {
+					modified[target] = true
+					appliedAny = true
+					fmt.Printf("Auto-fix applied to %s\n", target)
+				} else {
+					// If the generic fixer failed, and this looks like a missing '{'
+					// after a `type X struct` line, try a conservative inline edit
+					// (insert '{' at end of previous line). This is safe and can be
+					// rolled back by restoring backups on verification failure.
+					if globalAutoApply && strings.Contains(d.Message, "expected {") {
+						data, rerr := os.ReadFile(target)
+						if rerr == nil {
+							lines := strings.Split(string(data), "\n")
+							ln := d.Line - 1
+							prev := ln - 1
+							if prev >= 0 && prev < len(lines) {
+								trim := strings.TrimSpace(lines[prev])
+								if strings.HasPrefix(trim, "type ") && strings.Contains(trim, "struct") && !strings.Contains(lines[prev], "{") {
+									lines[prev] = lines[prev] + " {"
+									_ = os.WriteFile(target, []byte(strings.Join(lines, "\n")), 0644)
+									modified[target] = true
+									appliedAny = true
+									fmt.Printf("Conservative inline edit applied to %s\n", target)
+									goto applied_diag
+								}
+							}
+						}
+					}
+					// If still not applied, try converting an embedded field to a named
+					// field with a guessed type (string) when the compiler reports
+					// 'undefined: <Ident>' and auto-apply is enabled.
+					if globalAutoApply && strings.Contains(d.Message, "undefined:") {
+						m := regexp.MustCompile(`undefined:\s*([A-Za-z_][A-Za-z0-9_]*)`).FindStringSubmatch(d.Message)
+						if len(m) >= 2 {
+							ident := m[1]
+							data, rerr := os.ReadFile(target)
+							if rerr == nil {
+								lines := strings.Split(string(data), "\n")
+								for i, L := range lines {
+									if strings.TrimSpace(L) == ident {
+										// find previous non-empty line to detect struct context
+										prev := i - 1
+										for prev >= 0 && strings.TrimSpace(lines[prev]) == "" {
+											prev--
+										}
+										if prev >= 0 && strings.Contains(lines[prev], "struct") {
+											lines[i] = lines[i] + " string"
+											_ = os.WriteFile(target, []byte(strings.Join(lines, "\n")), 0644)
+											modified[target] = true
+											appliedAny = true
+											fmt.Printf("Conservative embedded-field->named-field edit applied to %s\n", target)
+											goto applied_diag
+										}
+									}
+								}
+							}
+						}
+					}
+					fmt.Printf("Auto-fix failed for %s\n", target)
 				}
-				slot := dense.CodeAwareSlot{}
-				slot.ParsedSlot.Action = "ADD_CONTEXT"
-				slot.ParsedSlot.TargetSymbol = o.symbol
-				applied, ok := dense.RouteAndExecuteWorkspaceWithCodeAwareSlot(wgraph2, "", slot)
-				if !ok {
-					fmt.Printf("failed to apply mutation for %s\n", o.symbol)
-					continue
+			applied_diag:
+				continue
+			}
+
+			// otherwise choose from heuristic opts
+			optIdx := chosen - len(diags)
+			if optIdx >= 0 && optIdx < len(opts) {
+				o := opts[optIdx]
+				if o.kind == "add_context" {
+					targetFile := o.file
+					if _, ok := backups[targetFile]; !ok {
+						if b, err := os.ReadFile(targetFile); err == nil {
+							backups[targetFile] = b
+						} else {
+							backups[targetFile] = nil
+						}
+					}
+					fmt.Printf("Injecting context param into %s in %s...\n", o.symbol, targetFile)
+					wgraph2, err := dense.IndexWorkspace(dir)
+					if err != nil {
+						fmt.Printf("failed to index workspace: %v\n", err)
+						continue
+					}
+					slot := dense.CodeAwareSlot{}
+					slot.ParsedSlot.Action = "ADD_CONTEXT"
+					slot.ParsedSlot.TargetSymbol = o.symbol
+					applied, ok := dense.RouteAndExecuteWorkspaceWithCodeAwareSlot(wgraph2, targetFile, slot)
+					if !ok {
+						fmt.Printf("failed to apply mutation for %s\n", o.symbol)
+						continue
+					}
+					fset := wgraph2.Fsets[applied]
+					node := wgraph2.Files[applied]
+					if err := writeFormattedFile(applied, fset, node); err != nil {
+						fmt.Printf("failed to write file %s: %v\n", applied, err)
+						continue
+					}
+					modified[applied] = true
+					appliedAny = true
+					fmt.Printf("Applied mutation to %s\n", applied)
 				}
-				fset := wgraph2.Fsets[applied]
-				node := wgraph2.Files[applied]
-				if err := writeFormattedFile(applied, fset, node); err != nil {
-					fmt.Printf("failed to write file %s: %v\n", applied, err)
-					continue
-				}
-				modified[applied] = true
-				appliedAny = true
-				fmt.Printf("Applied mutation to %s\n", applied)
 			}
 		}
-	}
 
-	if !appliedAny {
-		fmt.Println("No changes applied.")
+		if !appliedAny {
+			fmt.Println("No changes applied.")
+			fmt.Println("=== dense: suggestion pass complete ===")
+			return
+		}
+
+		// run `go test` to verify the workspace; if it fails, roll back
+		fmt.Println("Verifying changes by running 'go test ./...'...")
+		cmd := exec.Command("go", "test", "./...")
+		cmd.Dir = dir
+		var outb strings.Builder
+		cmd.Stdout = &outb
+		cmd.Stderr = &outb
+		err = cmd.Run()
+		if err != nil {
+			fmt.Printf("Verification failed: %v\nOutput:\n%s\nRolling back changes...\n", err, outb.String())
+			// restore backups
+			for fp, content := range backups {
+				if content == nil {
+					// no in-memory backup; if auto-restore from git is enabled, try that
+					if globalAutoRestoreGit {
+						cmd := exec.Command("git", "checkout", "--", fp)
+						cmd.Dir = dir
+						if rerr := cmd.Run(); rerr == nil {
+							fmt.Printf("Restored %s from git HEAD\n", fp)
+							continue
+						}
+					}
+					// otherwise skip
+					continue
+				}
+				_ = os.WriteFile(fp, content, 0644)
+				fmt.Printf("Restored %s\n", fp)
+			}
+			fmt.Println("Rollback complete.")
+		} else {
+			fmt.Println("Verification passed. Changes kept.")
+			// remove backup entries (in-memory) - nothing to do on disk
+		}
+
 		fmt.Println("=== dense: suggestion pass complete ===")
+	}()
+
+	if timeout == 0 {
+		<-done
 		return
 	}
 
-	// run `go test` to verify the workspace; if it fails, roll back
-	fmt.Println("Verifying changes by running 'go test ./...'...")
-	cmd := exec.Command("go", "test", "./...")
-	cmd.Dir = dir
-	var outb strings.Builder
-	cmd.Stdout = &outb
-	cmd.Stderr = &outb
-	err = cmd.Run()
-	if err != nil {
-		fmt.Printf("Verification failed: %v\nOutput:\n%s\nRolling back changes...\n", err, outb.String())
-		// restore backups
-		for fp, content := range backups {
-			if content == nil {
-				// no in-memory backup; if auto-restore from git is enabled, try that
-				if globalAutoRestoreGit {
-					cmd := exec.Command("git", "checkout", "--", fp)
-					cmd.Dir = dir
-					if rerr := cmd.Run(); rerr == nil {
-						fmt.Printf("Restored %s from git HEAD\n", fp)
-						continue
-					}
-				}
-				// otherwise skip
-				continue
-			}
-			_ = os.WriteFile(fp, content, 0644)
-			fmt.Printf("Restored %s\n", fp)
-		}
-		fmt.Println("Rollback complete.")
-	} else {
-		fmt.Println("Verification passed. Changes kept.")
-		// remove backup entries (in-memory) - nothing to do on disk
+	select {
+	case <-done:
+		return
+	case <-time.After(timeout):
+		fmt.Printf("=== dense: suggestion pass timed out after %s ===\n", timeout)
+		return
 	}
-
-	fmt.Println("=== dense: suggestion pass complete ===")
 }
 
 func writeFormattedFile(filePath string, fset *token.FileSet, node *ast.File) error {

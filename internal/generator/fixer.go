@@ -53,6 +53,14 @@ func DiagnoseProject(dir string) ([]GoError, error) {
 		dir = "."
 	}
 
+	// go build ./... catches syntax errors in all packages, including those
+	// with no test files (e.g. jim/) that go test ./... silently skips.
+	if buildOut, _ := runGoCommand(dir, "go", "build", "./..."); buildOut != "" {
+		if parsed := parseGoErrors(buildOut); len(parsed) > 0 {
+			return parsed, nil
+		}
+	}
+
 	out, _ := runGoCommand(dir, "go", "test", "./...")
 	if parsed := parseGoErrors(out); len(parsed) > 0 {
 		return parsed, nil
@@ -147,6 +155,13 @@ func AutoFixFile(errItem GoError) bool {
 								break
 							}
 							// other heuristics could go here
+							if strings.HasPrefix(s, "return &") {
+								parts := strings.Split(s[8:], "{")
+								if len(parts) > 0 {
+									retType = "*" + parts[0]
+									break
+								}
+							}
 						}
 					}
 					if retType != "" {
