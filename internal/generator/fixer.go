@@ -3,19 +3,43 @@ package generator
 import (
 	"bytes"
 	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 // GoError describes a single compiler or test error recognized from Go output.
 type GoError struct {
 	FilePath string
-	Line     string
-	Column   string
+	Line     int
+	Column   int
 	Message  string
+}
+
+var stdPkgMap = map[string]string{
+	"fmt":      "fmt",
+	"http":     "net/http",
+	"json":     "encoding/json",
+	"os":       "os",
+	"time":     "time",
+	"bytes":    "bytes",
+	"strings":  "strings",
+	"context":  "context",
+	"sync":     "sync",
+	"filepath": "path/filepath",
+	"io":       "io",
+	"exec":     "os/exec",
+	"regexp":   "regexp",
+	"ast":      "go/ast",
+	"token":    "go/token",
+	"parser":   "go/parser",
 }
 
 // DiagnoseProject runs the Go toolchain against a project and captures compiler errors.
@@ -67,14 +91,75 @@ func parseGoErrors(output string) []GoError {
 		if len(m) < 5 {
 			continue
 		}
+		line, _ := strconv.Atoi(m[2])
+		col, _ := strconv.Atoi(m[3])
 		out = append(out, GoError{
 			FilePath: m[1],
-			Line:     m[2],
-			Column:   m[3],
+			Line:     line,
+			Column:   col,
 			Message:  m[4],
 		})
 	}
 	return out
+}
+
+// AutoFixFile attempts to repair common go compilation errors using AST-editing.
+func AutoFixFile(errItem GoError) bool {
+	if strings.TrimSpace(errItem.FilePath) == "" {
+		return false
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), errItem.FilePath, nil, parser.ParseComments)
+	if err != nil {
+		return false
+	}
+	if file.Name == nil {
+		file.Name = ast.NewIdent("main")
+	}
+	fixed := false
+	for _, match := range regexp.MustCompile(`undefined:\s*([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(errItem.Message, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		ident := match[1]
+		if pkgPath, exists := stdPkgMap[ident]; exists {
+			if AddImportToAST(file, pkgPath) {
+				fixed = true
+			}
+		}
+	}
+	if !fixed {
+		return false
+	}
+	var buf bytes.Buffer
+	if err := format.Node(&buf, token.NewFileSet(), file); err != nil {
+		return false
+	}
+	if err := os.WriteFile(errItem.FilePath, buf.Bytes(), 0644); err != nil {
+		return false
+	}
+	return true
+}
+
+// AddImportToAST dynamically inserts a missing import path into the AST file header.
+func AddImportToAST(file *ast.File, importPath string) bool {
+	if file == nil || strings.TrimSpace(importPath) == "" {
+		return false
+	}
+	for _, imp := range file.Imports {
+		if imp != nil && imp.Path != nil && imp.Path.Value == strconv.Quote(importPath) {
+			return false
+		}
+	}
+	newImport := &ast.ImportSpec{Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(importPath)}}
+	for _, decl := range file.Decls {
+		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
+			genDecl.Specs = append(genDecl.Specs, newImport)
+			return true
+		}
+	}
+	importDecl := &ast.GenDecl{Tok: token.IMPORT, Specs: []ast.Spec{newImport}}
+	file.Decls = append([]ast.Decl{importDecl}, file.Decls...)
+	return true
 }
 
 // TryAutoFixFile attempts a minimal safe fix for a broken Go file based on the compiler error.
@@ -86,35 +171,29 @@ func TryAutoFixFile(filePath, message string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	updated := string(content)
-	trimmed := strings.TrimSpace(updated)
-	if !strings.HasPrefix(trimmed, "package ") {
-		updated = "package main\n\n" + updated
+	file, parseErr := parser.ParseFile(token.NewFileSet(), filePath, content, parser.ParseComments)
+	if parseErr != nil {
+		return false, parseErr
 	}
-	if strings.Contains(message, "undefined: fmt") && strings.Contains(updated, "fmt.") && !strings.Contains(updated, "import \"fmt\"") {
-		updated = strings.Replace(updated, "package main\n\n", "package main\n\nimport \"fmt\"\n\n", 1)
-	}
-	if strings.Contains(message, "undefined:") {
-		for _, match := range regexp.MustCompile(`undefined:\s*([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(message, -1) {
-			if len(match) < 2 {
-				continue
-			}
-			ident := match[1]
-			if ident == "fmt" {
-				if !strings.Contains(updated, "import \"fmt\"") {
-					updated = strings.Replace(updated, "package main\n\n", "package main\n\nimport \"fmt\"\n\n", 1)
-				}
-				continue
-			}
-			if !strings.Contains(updated, "var "+ident) && !strings.Contains(updated, ident+" ") {
-				updated = strings.Replace(updated, "func main()", "var "+ident+" = \"\"\n\nfunc main()", 1)
+	fixed := false
+	for _, match := range regexp.MustCompile(`undefined:\s*([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(message, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		if pkgPath, exists := stdPkgMap[match[1]]; exists {
+			if AddImportToAST(file, pkgPath) {
+				fixed = true
 			}
 		}
 	}
-	if updated == string(content) {
+	if !fixed {
 		return false, nil
 	}
-	if err := os.WriteFile(filePath, []byte(updated), 0644); err != nil {
+	var buf bytes.Buffer
+	if err := format.Node(&buf, token.NewFileSet(), file); err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(filePath, buf.Bytes(), 0644); err != nil {
 		return false, err
 	}
 	return true, nil

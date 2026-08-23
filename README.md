@@ -173,3 +173,20 @@ This project is intentionally lightweight and deterministic. It favors:
 - Go AST generation and validation for safe edits
 
 That combination is well suited for simple developer-side automation and structured code editing tasks.
+
+## Learned capabilities (from advocate files & resource links)
+
+Since ingesting advocate notes and linked resources, Dense has acquired these practical, workspace-aware abilities:
+
+- **Workspace indexing**: builds a cross-file `WorkspaceGraph` of symbols and ASTs for precise target resolution.
+- **Intent parsing & routing**: maps natural-language prompts to explicit actions (ADD_FUNC, ADD_TYPE, REPLACE, INJECT_TAGS, ADD_VAR, ADD_DECL, etc.).
+- **AST-safe edits**: makes top-level and function-level edits via AST helpers (`Append*`, `ReplaceFunctionDecl`, `AppendGenericDecl`) rather than raw text.
+- **Signature inference**: when users provide short function names, Dense infers parameter and result lists from existing symbols to create plausible signatures.
+- **Webserver scaffolding**: recognizes requests for a web/http server and inserts a safe, uniquely-named server scaffold (StartServer-style) into the requested file.
+- **Code extraction from tutorials**: can fetch tutorial pages and extract Go code blocks (```go``` / `<pre><code>`) to insert as declarations.
+- **Automated diagnostics & fixes**: runs `go` commands to collect compiler errors, parses the output, and applies conservative fixes (e.g., missing imports) in an iterative `dense fix` loop.
+- **REPL & CLI integration**: interactive `dense_llm` REPL and `dense` CLI commands persist AST edits and support one-shot prompts for automation.
+- **DOCX / taxonomy extraction**: extracts resource links and taxonomy entries from DOCX documents to inform generation and provide references.
+- **Safety-first workflow**: validates generated code with the Go parser/type-checker, formats output, and only writes changes that pass parsing and basic checks.
+
+These capabilities make Dense practical for small-scale code generation, conservative automated fixes, and interactive developer workflows where safety and workspace-awareness are important.

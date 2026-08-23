@@ -51,6 +51,27 @@ func TestCodeAwareFixAndGenerateIntent(t *testing.T) {
 		}
 	}
 }
+
+func TestCLISubcommandWiring(t *testing.T) {
+	tests := []struct {
+		args        []string
+		expectedCmd string
+	}{
+		{[]string{"dense", "fix"}, "fix"},
+		{[]string{"dense", "generate", "User"}, "generate"},
+	}
+
+	for _, tt := range tests {
+		if len(tt.args) < 2 {
+			t.Fatalf("Test case missing command argument")
+		}
+		cmd := tt.args[1]
+		if cmd != tt.expectedCmd {
+			t.Errorf("Expected subcommand %s, got %s", tt.expectedCmd, cmd)
+		}
+	}
+}
+
 func TestEndToEndFixWorkflow(t *testing.T) {
 	tmpDir := t.TempDir()
 	brokenFile := filepath.Join(tmpDir, "main.go")
@@ -64,6 +85,34 @@ func TestEndToEndFixWorkflow(t *testing.T) {
 	}
 	if len(errs) == 0 {
 		t.Fatalf("expected compiler errors for broken file, got 0")
+	}
+}
+
+func TestAutoFixerMissingImport(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "main.go")
+	brokenCode := `package main
+
+func main() {
+    fmt.Println("hello world")
+}
+`
+	if err := os.WriteFile(testFile, []byte(brokenCode), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	errItem := generator.GoError{FilePath: testFile, Line: 4, Column: 2, Message: "undefined: fmt"}
+	fixed := generator.AutoFixFile(errItem)
+	if !fixed {
+		t.Fatalf("Expected AutoFixFile to return true for missing fmt import")
+	}
+
+	content, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("Failed to read updated file: %v", err)
+	}
+	if !strings.Contains(string(content), "\"fmt\"") {
+		t.Errorf("Expected updated content to contain import \"fmt\", got:\n%s", string(content))
 	}
 }
 func TestCodeAwareAddStructKeepsTypeAction(t *testing.T) {

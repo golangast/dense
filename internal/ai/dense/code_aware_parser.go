@@ -186,6 +186,30 @@ func ParseCodeAwarePrompt(prompt string, graph *WorkspaceGraph) CodeAwareSlot {
 		return slot
 	}
 
+	// 5a. Explicit webserver / web server intent: map to ADD_FUNC with a small
+	// HTTP handler scaffold. Prefer a unique function name that doesn't clash
+	// with existing symbols in the workspace graph.
+	lowerPrompt := strings.ToLower(prompt)
+	if strings.Contains(lowerPrompt, "webserver") || strings.Contains(lowerPrompt, "web server") || strings.Contains(lowerPrompt, "http server") || strings.Contains(lowerPrompt, "listenandserve") {
+		// choose a base name and avoid collisions with existing symbols
+		base := "StartServer"
+		name := base
+		if graph != nil {
+			i := 1
+			for {
+				if _, exists := graph.Symbols[name]; !exists {
+					break
+				}
+				i++
+				name = fmt.Sprintf("%s%d", base, i)
+			}
+		}
+		slot.Action = "ADD_FUNC"
+		slot.TargetSymbol = name
+		slot.PayloadCode = fmt.Sprintf("func %s() {\n\thttp.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {\n\t\tfmt.Fprintln(w, \"hello from %s\")\n\t})\n\tif err := http.ListenAndServe(\":8080\", nil); err != nil {\n\t\tlog.Println(err)\n\t}\n}", name, name)
+		return slot
+	}
+
 	if m := closureRegex.FindStringSubmatch(prompt); len(m) > 1 {
 		funcName := strings.Title(m[1])
 		slot.Action = "ADD_FUNC"

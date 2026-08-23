@@ -10,51 +10,33 @@ import (
 	"github.com/golangast/dense/internal/generator"
 )
 
-// RunFixCommand runs the compiler diagnosis loop and applies the smallest safe fix.
+// RunFixCommand runs a compiler diagnosis loop and repairs common issues in place.
 func RunFixCommand(workDir string) error {
 	fmt.Println("🔍 Diagnosing project for compiler errors...")
 
-	errs, err := generator.DiagnoseProject(workDir)
-	if err != nil {
-		return fmt.Errorf("failed to run diagnosis: %w", err)
-	}
-	if len(errs) == 0 {
-		fmt.Println("✅ No compilation errors detected!")
-		return nil
-	}
-
-	fmt.Printf("⚠️ Found %d error(s). Attempting auto-fix...\n", len(errs))
-	changed := false
-	for _, e := range errs {
-		fmt.Printf(" ↳ Fix target: %s:%s - %s\n", e.FilePath, e.Line, e.Message)
-		patched, patchErr := generator.TryAutoFixFile(e.FilePath, e.Message)
-		if patchErr != nil {
-			fmt.Printf("   - patch failed: %v\n", patchErr)
-			continue
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		errs, err := generator.DiagnoseProject(workDir)
+		if err != nil {
+			return fmt.Errorf("failed to run diagnosis: %w", err)
 		}
-		if patched {
-			changed = true
+		if len(errs) == 0 {
+			fmt.Println("✅ All compilation errors fixed successfully!")
+			return nil
 		}
-	}
 
-	if !changed {
-		fmt.Println("No safe automatic patch was applied.")
-		return nil
-	}
-
-	fmt.Println("🧪 Re-running compiler diagnostics...")
-	recheck, recheckErr := generator.DiagnoseProject(workDir)
-	if recheckErr != nil {
-		return fmt.Errorf("failed to validate auto-fix: %w", recheckErr)
-	}
-	if len(recheck) == 0 {
-		fmt.Println("✅ Auto-fix resolved all compilation errors.")
-		return nil
-	}
-
-	fmt.Printf("⚠️ %d error(s) remain after auto-fix.\n", len(recheck))
-	for _, e := range recheck {
-		fmt.Printf(" ↳ Remaining: %s:%s - %s\n", e.FilePath, e.Line, e.Message)
+		fmt.Printf("⚠️ Attempt %d/%d: Found %d error(s). Repairing...\n", i+1, maxRetries, len(errs))
+		anyFixed := false
+		for _, e := range errs {
+			fmt.Printf(" ↳ Auto-fixing %s:%d: %s\n", e.FilePath, e.Line, e.Message)
+			if generator.AutoFixFile(e) {
+				anyFixed = true
+			}
+		}
+		if !anyFixed {
+			fmt.Println("❌ Unable to resolve remaining errors automatically.")
+			break
+		}
 	}
 	return nil
 }
