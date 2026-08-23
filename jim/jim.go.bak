@@ -1,5 +1,0 @@
-package Jake
-
-func jim() int {
-	return 1
-}

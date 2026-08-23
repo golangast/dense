@@ -10,6 +10,10 @@
 [![Code Coverage](https://img.shields.io/badge/coverage-85%25-brightgreen.svg?style=for-the-badge&logo=codecov&logoColor=white)](https://github.com/golangast/dense)
 [![CodeQL Security](https://img.shields.io/badge/CodeQL-passing-blue.svg?style=for-the-badge&logo=github&logoColor=white)](https://github.com/golangast/dense/security/code-scanning)
 
+[![Unit Tests](https://img.shields.io/github/actions/workflow/status/golangast/dense/unit-tests.yml?branch=main&label=unit%20tests&style=for-the-badge&logo=github)](https://github.com/golangast/dense/actions)
+[![Integration Tests](https://img.shields.io/github/actions/workflow/status/golangast/dense/integration-tests.yml?branch=main&label=integration%20tests&style=for-the-badge&logo=github)](https://github.com/golangast/dense/actions)
+[![Codecov](https://img.shields.io/codecov/c/github/golangast/dense?style=for-the-badge)](https://codecov.io/gh/golangast/dense)
+
 [![Latest Release](https://img.shields.io/github/v/release/golangast/dense?style=for-the-badge&logo=github&color=blue)](https://github.com/golangast/dense/releases)
 [![GitHub License](https://img.shields.io/github/license/golangast/dense?style=for-the-badge&color=blue)](https://github.com/golangast/dense/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/golangast/dense?style=for-the-badge&logo=github)](https://github.com/golangast/dense/stargazers)
@@ -271,7 +275,13 @@ golangast-dense/
 ---
 
 ## ⚙️ Requirements
+## License
 
+This project is licensed under the GNU General Public License v3.0.
+See the full license in [LICENSE](LICENSE).
+
+
+## ⚙️ Requirements
 * **Go**: 1.26 or higher
 * **Git** (optional): Recommended for auto-restore features during `make watch`.
 
