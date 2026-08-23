@@ -13,8 +13,8 @@ import (
 // Server is a lightweight HTTP server scaffold for package jim used by the
 // interactive code generator tests and manual prompts.
 type Server struct {
-	Addr string
-	srv  *http.Server
+	Addr
+	srv *http.Server
 }
 
 // NewServer creates a Server bound to the provided address (e.g. ":8080").
