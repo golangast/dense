@@ -1,151 +1,164 @@
+
+<div align="center">
+
+[![Go Version](https://img.shields.io/github/go-mod/go-version/golangast/dense?style=for-the-badge&logo=go&logoColor=white)](https://github.com/golangast/dense)
+[![GoDoc](https://img.shields.io/badge/godoc-reference-007d9c.svg?style=for-the-badge&logo=go&logoColor=white)](https://pkg.go.dev/github.com/golangast/dense)
+[![Go Report Card](https://goreportcard.com/badge/github.com/golangast/dense?style=for-the-badge)](https://goreportcard.com/report/github.com/golangast/dense)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg?style=for-the-badge&logo=github-actions)](https://github.com/golangast/dense)
+[![Status](https://img.shields.io/badge/Status-Beta-orange.svg?style=for-the-badge)](https://github.com/golangast/dense)
+
+[![GitHub License](https://img.shields.io/github/license/golangast/dense?style=for-the-badge)](https://github.com/golangast/dense/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/golangast/dense?style=for-the-badge&logo=github)](https://github.com/golangast/dense/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/golangast/dense?style=for-the-badge&logo=github)](https://github.com/golangast/dense/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/golangast/dense?style=for-the-badge&logo=github)](https://github.com/golangast/dense/issues)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=for-the-badge)](http://makeapullrequest.com)
+
+</div>
+
+<br />
+
+> **A Golang Developer focused on building Custom Natural Language Processing (NLP) solutions.**
+
+---
+
+## 🚀 About Me
+
+As a versatile **Golang Developer**, I specialize in high-performance, custom-built **Natural Language Processing (NLP) models**. My commitment is to deliver robust, efficient, and novel solutions for complex structured language interpretation, with a core focus on systems like my **nlptagger** and **Dense** projects.
+
+---
+
 # Dense
 
 Dense is a compact Go project for training and using a dense neural model that classifies developer prompts and turns them into safe code actions. The system combines a small MLP model, deterministic intent parsing, and Go AST-aware validation to support interactive Go editing.
 
-## What it can do
+## 📋 Table of Contents
 
-### 1. Train the dense model
+- [What It Can Do](#what-it-can-do)
+- [Typical Usage Patterns](#typical-usage-patterns)
+- [Project Layout](#project-layout)
+- [Learned Capabilities](#learned-capabilities)
+- [Make Watch](#make-watch)
+- [GitHub Stats & Coding Activity](#-github-stats--coding-activity)
+- [General Info & Architecture](#general-info)
+- [Requirements](#requirements)
+- [Reference Commands](#reference-commands)
 
+---
+
+## What It Can Do
+
+### 1. Train the Dense Model
 The project includes a training tool that loads command examples, learns a simple dense MLP classifier, and saves the model to disk.
 
 ```bash
-go run ./cmd/tools/dense_train -data=data/training/command_examples.pb -model=data/models/dense/model.gob
+make train
+# Or run built binary directly:
+./bin/dense_train -data=data/training/command_examples.pb -model=data/models/dense/model.gob
+
 ```
 
-This is useful for:
-- training a classifier over command examples
-- updating the model with new prompt patterns
-- generating a reusable model for interactive editing
+* **Training over command examples**
+* **Updating the model with new prompt patterns**
+* **Generating reusable models for interactive editing and CI**
 
-### 2. Run the interactive Go assistant
+### 2. Run the Interactive Go Assistant
 
-The CLI supports an interactive shell for prompt-driven code work.
+Use the Make target to build and run the interactive assistant:
 
 ```bash
-go run ./cmd/tools/dense_llm -model=data/models/dense/model.gob
+make llm
+# Or run built binary with flags:
+./bin/dense_llm -model=data/models/dense/model.gob
+
 ```
 
-In interactive mode you can:
-- type natural-language Go editing requests
-- ask for code generation or file operations
-- keep multiple independent conversations open
-- target a different Go file per conversation
-- use slash commands to manage sessions and files
+### 3. Support Multiple Conversations
 
-### 3. Support multiple conversations
+The assistant maintains multiple named conversations at once using built-in slash commands:
 
-The assistant maintains multiple named conversations at once.
+* `/new [name]`
+* `/list`
+* `/switch <name>`
+* `/delete <name>`
+* `/current`
+* `/file <path>`
+* `/help`
 
-Slash commands:
-- /new [name]
-- /list
-- /switch <name>
-- /delete <name>
-- /current
-- /file <path>
-- /help
+### 4. Target Files for Direct Editing
 
-This makes it easy to work on several code threads or separate tasks without mixing context.
-
-### 4. Target files for direct editing
-
-Each conversation can point at a Go file to update.
-
-Examples:
+Each conversation can point at a Go file to update directly:
 
 ```text
 /file ./internal/ai/dense/example.go
-```
 
-You can also set a default file at startup:
+```
 
 ```bash
-go run ./cmd/tools/dense_llm -model=data/models/dense/model.gob -file ./example.go
+# Run interactive with target file:
+./bin/dense_llm -model=data/models/dense/model.gob -file ./example.go
+
 ```
 
-### 5. Generate Go code from intent
+### 5. Generate Go Code from Intent
 
-The agent can infer intents such as:
-- create function
-- create method
-- add import
-- add struct or type
-- add unit test
-- insert error checks
-- create helper return patterns
-- edit or delete existing symbols
+Infers prompt intent to create functions, methods, imports, structs, unit tests, error checks, and symbol deletions via Go AST.
 
-The formatter deterministically renders Go snippets using the Go AST and writes valid source code when possible.
+### 6. Modify Go Files Safely via AST-Based Edits
 
-### 6. Modify Go files safely with AST-based edits
+Uses AST manipulation rather than string concatenation for:
 
-Rather than blindly appending text, the CLI uses AST manipulation for common operations:
-- import insertion
-- function insertion/replacement
-- type and struct insertion
-- receiver-aware method generation
-- symbol replacement when a function already exists
+* Import insertion
+* Function insertion/replacement
+* Type and struct insertion
+* Receiver-aware method generation
 
-This reduces malformed output and keeps edits consistent with the existing Go file structure.
+### 7. Validate Generated Code Before Saving
 
-### 7. Validate generated code before saving
+Validates using `go/parser` and `go/types` prior to filesystem updates:
 
-Before a change is written, the project checks the resulting code with Go parsing and type-check validation using the Go type checker.
+* Parse validation
+* Type validation via `go/types`
+* Package-scope symbol inspection
+* Import safety checks
 
-Safety features include:
-- parse validation
-- type validation via go/types
-- package-scope symbol inspection
-- import safety checks
-- rejection of broken AST output before writing to disk
+### 8. Understand Package-Level Context
 
-This is especially important when generating new functions that reference custom types or packages that are not yet declared in the target file.
+Inspects surrounding workspace files to infer existing functions, types, and imported packages to avoid duplicate or conflicting declarations.
 
-### 8. Understand package-level context
+### 9. Handle Non-Go File Operations
 
-The system inspects the package directory and nearby files to gather context about:
-- existing functions
-- existing types
-- imported packages
+Supports folder creation, file editing, and file creation/deletion through conversational flow.
 
-This helps the assistant choose better actions when editing a Go package and avoid generating duplicate or conflicting declarations.
+### 10. Run One-Shot Prompt Classification
 
-### 9. Handle non-Go file operations too
-
-The CLI is not limited to Go code generation. It also supports higher-level file and folder operations, including:
-- create file
-- edit file
-- delete file
-- create folder
-- delete folder
-
-These actions are routed through the same conversational flow and can be used alongside the Go-editing behavior.
-
-### 10. Run one-shot prompt classification
-
-You can classify and respond to a single prompt without entering the interactive shell:
+Execute single prompt actions via CLI without opening an interactive shell:
 
 ```bash
-go run ./cmd/tools/dense_llm -model=data/models/dense/model.gob -prompt 'create function Sum(a int, b int) int'
+make build-dense_llm
+./bin/dense_llm -model=data/models/dense/model.gob -prompt 'create function Sum(a int, b int) int'
+
 ```
 
-This is useful for tests, automation, scripting, and quick prompt-debugging.
+---
 
-## Typical usage patterns
+## Typical Usage Patterns
 
-### Train a model
+### Train a Model
 
 ```bash
-go run ./cmd/tools/dense_train -data=data/training/command_examples.pb -model=data/models/dense/model.gob
+make train
+./bin/dense_train -data=data/training/command_examples.pb -model=data/models/dense/model.gob
+
 ```
 
-### Start the interactive assistant
+### Start Interactive Assistant
 
 ```bash
-go run ./cmd/tools/dense_llm -model=data/models/dense/model.gob
+make llm
+
 ```
 
-Then try prompts like:
+Example commands inside shell:
 
 ```text
 create function ComputeSum(a int, b int) int
@@ -154,39 +167,104 @@ create method DoThing on Service(a int) error
 add unit test for DoWork
 create struct User
 create file main.go
+
 ```
 
-## Project layout
+---
 
-- cmd/tools/dense_train: training entry point
-- cmd/tools/dense_llm: interactive LLM-like assistant and editor
-- internal/ai/dense: dense model, feature extraction, classification logic
-- internal/ai/training: command example schema and training data support
-- data/models/dense: saved trained model artifacts
-- data/training: command example corpus
+## Project Layout
 
-## Notes
+```text
+├── cmd/tools/
+│   ├── dense_train/   # Training entry point
+│   └── dense_llm/     # Interactive LLM-like assistant and editor
+├── internal/ai/
+│   ├── dense/         # Dense model, feature extraction, AST editing logic
+│   └── training/      # Command example schema and corpus support
+├── data/
+│   ├── models/dense/  # Saved trained model artifacts
+│   └── training/      # Command example datasets
 
-This project is intentionally lightweight and deterministic. It favors:
-- a small neural model for classification
-- explicit parsing for common prompt patterns
-- Go AST generation and validation for safe edits
+```
 
-That combination is well suited for simple developer-side automation and structured code editing tasks.
+---
 
-## Learned capabilities (from advocate files & resource links)
+## Learned Capabilities
 
-Since ingesting advocate notes and linked resources, Dense has acquired these practical, workspace-aware abilities:
+Dense incorporates several workspace-aware features:
 
-- **Workspace indexing**: builds a cross-file `WorkspaceGraph` of symbols and ASTs for precise target resolution.
-- **Intent parsing & routing**: maps natural-language prompts to explicit actions (ADD_FUNC, ADD_TYPE, REPLACE, INJECT_TAGS, ADD_VAR, ADD_DECL, etc.).
-- **AST-safe edits**: makes top-level and function-level edits via AST helpers (`Append*`, `ReplaceFunctionDecl`, `AppendGenericDecl`) rather than raw text.
-- **Signature inference**: when users provide short function names, Dense infers parameter and result lists from existing symbols to create plausible signatures.
-- **Webserver scaffolding**: recognizes requests for a web/http server and inserts a safe, uniquely-named server scaffold (StartServer-style) into the requested file.
-- **Code extraction from tutorials**: can fetch tutorial pages and extract Go code blocks (```go``` / `<pre><code>`) to insert as declarations.
-- **Automated diagnostics & fixes**: runs `go` commands to collect compiler errors, parses the output, and applies conservative fixes (e.g., missing imports) in an iterative `dense fix` loop.
-- **REPL & CLI integration**: interactive `dense_llm` REPL and `dense` CLI commands persist AST edits and support one-shot prompts for automation.
-- **DOCX / taxonomy extraction**: extracts resource links and taxonomy entries from DOCX documents to inform generation and provide references.
-- **Safety-first workflow**: validates generated code with the Go parser/type-checker, formats output, and only writes changes that pass parsing and basic checks.
+* **Workspace Indexing**: Builds a cross-file `WorkspaceGraph` of symbols and ASTs.
+* **Intent Parsing & Routing**: Maps prompts directly to explicit AST actions (`ADD_FUNC`, `ADD_TYPE`, `REPLACE`, `INJECT_TAGS`, etc.).
+* **Signature Inference**: Infers parameter/result lists from existing symbols when prompts provide short function names.
+* **Webserver Scaffolding**: Instantly generates safe HTTP server scaffolds (`StartServer`).
+* **Automated Diagnostics & Fixes**: Captures `go` compiler errors and applies conservative iterative fixes via `dense fix`.
+* **Safety-First Workflow**: Full validation pass via Go parser and type-checker before writing to disk.
 
-These capabilities make Dense practical for small-scale code generation, conservative automated fixes, and interactive developer workflows where safety and workspace-awareness are important.
+---
+
+## Make Watch
+
+* **Purpose**: `make watch` builds and runs `dense_watch` to monitor the workspace for file changes and apply automatic, AST-aware fixes.
+* **Execution**: `make watch` (runs `./bin/dense_watch -dir=. -auto-apply`).
+* **Supported Flags**:
+* `-dir`: Directory to watch (default `.`)
+* `-debounce`: Debounce interval (default `500ms`)
+* `-auto-apply`: Automatically apply previewed fixes
+* `-auto-restore-git`: Restores from `git` HEAD if verification fails
+* `-poll`: Periodically runs suggestion passes
+
+
+
+---
+
+## 📊 GitHub Stats & Coding Activity
+
+<div align="center">
+<img src="https://github-profile-summary-cards.vercel.app/api/cards/profile-details?username=golangast&theme=radical" alt="GitHub Profile Summary" />
+
+
+
+
+
+<img src="https://github-readme-tech-stack.vercel.app/api/cards?username=golangast&theme=radical" alt="GitHub Tech Stack" />
+
+
+
+
+
+<a href="https://github.com/golangast">
+<img src="https://github-readme-activity-graph.vercel.app/graph?username=golangast&theme=radical" alt="Zachary's GitHub Activity Graph" />
+</a>
+
+
+
+
+
+<img src="https://github-readme-stats.vercel.app/api?username=golangast&show_icons=true&theme=radical&hide_border=true" alt="Zachary's GitHub Stats" />
+<img src="https://github-readme-stats.vercel.app/api/top-langs/?username=golangast&layout=compact&theme=radical&hide_border=true" alt="Top Languages" />
+
+
+
+
+
+<img src="https://streak-stats.demolab.com/?user=golangast&theme=radical&hide_border=true" alt="GitHub Streak" />
+</div>
+
+---
+
+## General Info
+
+* **Technologies**: Go 1.26+, Go AST, `go/types`, `fsnotify`.
+* **Requirements**: Go 1.26 or later, `git` (optional, for auto-restore features).
+
+## Reference Commands
+
+* `make build` — Build all workspace binaries into `bin/`
+* `make train` — Build and run the trainer tool
+* `make llm` — Build and launch the interactive assistant
+* `make watch` — Start the workspace watcher with auto-apply enabled
+EOF
+
+```
+
+```

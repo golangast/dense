@@ -1,13 +1,9 @@
 package jim
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"time"
 )
 
 // Server is a lightweight HTTP server scaffold for package jim used by the
