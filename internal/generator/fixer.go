@@ -196,6 +196,49 @@ func AutoFixFile(errItem GoError) bool {
 				}
 			}
 		}
+
+		// handle composite-literal newline errors by adding a trailing comma
+		if strings.Contains(errItem.Message, "unexpected newline in composite literal") || strings.Contains(errItem.Message, "possibly missing comma") {
+			data, rerr := os.ReadFile(errItem.FilePath)
+			if rerr != nil {
+				return false
+			}
+			lines := strings.Split(string(data), "\n")
+			ln := errItem.Line - 1
+			prev := ln - 1
+			if prev >= 0 && prev < len(lines) {
+				if !strings.HasSuffix(strings.TrimRight(lines[prev], " \t"), ",") && !strings.HasSuffix(strings.TrimRight(lines[prev], " \t"), "}") {
+					lines[prev] = lines[prev] + ","
+					out := strings.Join(lines, "\n")
+					if werr := os.WriteFile(errItem.FilePath, []byte(out), 0644); werr == nil {
+						return true
+					}
+				}
+			}
+		}
+
+		// handle split 'err !=' style broken lines: join with following 'nil' line
+		if strings.Contains(errItem.Message, "unexpected name error at end of statement") || strings.Contains(errItem.Message, "expected '{' after function body") {
+			data, rerr := os.ReadFile(errItem.FilePath)
+			if rerr != nil {
+				return false
+			}
+			lines := strings.Split(string(data), "\n")
+			ln := errItem.Line - 1
+			if ln >= 1 && ln+1 < len(lines) {
+				left := strings.TrimRight(lines[ln-1], " \t")
+				right := strings.TrimSpace(lines[ln])
+				if strings.HasSuffix(left, "!=") && (strings.HasPrefix(right, "nil") || strings.HasPrefix(right, "err")) {
+					lines[ln-1] = left + " " + right
+					// remove the now-merged line
+					lines = append(lines[:ln], lines[ln+1:]...)
+					out := strings.Join(lines, "\n")
+					if werr := os.WriteFile(errItem.FilePath, []byte(out), 0644); werr == nil {
+						return true
+					}
+				}
+			}
+		}
 		return false
 	}
 	if file.Name == nil {
